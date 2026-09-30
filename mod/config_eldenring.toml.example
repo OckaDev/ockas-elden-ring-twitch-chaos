@@ -1,0 +1,20 @@
+# Example Mod Engine 2 config — paths are relative to the ME2 folder.
+# Copy values into your real config_eldenring.toml.
+
+[modengine]
+debug = false
+external_dlls = [
+  "SeamlessCoop/ersc.dll",
+  "dllMods/EldenChaos.dll"
+]
+
+[extension.mod_loader]
+enabled = true
+loose_params = false
+
+mods = [
+  { enabled = true, name = "default", path = "mod" }
+]
+
+[extension.scylla_hide]
+enabled = false

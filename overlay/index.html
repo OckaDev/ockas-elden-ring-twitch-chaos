@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ocka's Elden Chaos Overlay</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=Spectral:wght@400;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --ink: #f3e6c8;
+      --ember: #c45c26;
+      --ember-glow: rgba(196, 92, 38, 0.55);
+      --shadow: rgba(8, 6, 4, 0.72);
+      --line: rgba(243, 230, 200, 0.28);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: transparent;
+      font-family: "Spectral", serif;
+      color: var(--ink);
+    }
+
+    #stage {
+      position: absolute;
+      left: 50%;
+      top: 12%;
+      transform: translateX(-50%);
+      width: min(920px, 92vw);
+      pointer-events: none;
+    }
+
+    .banner {
+      opacity: 0;
+      transform: translateY(-18px) scale(0.98);
+      filter: blur(2px);
+      transition:
+        opacity 420ms ease,
+        transform 520ms cubic-bezier(0.2, 0.9, 0.2, 1),
+        filter 420ms ease;
+    }
+
+    .banner.show {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+      filter: blur(0);
+    }
+
+    .banner.hide {
+      opacity: 0;
+      transform: translateY(-10px);
+      filter: blur(3px);
+    }
+
+    .plate {
+      position: relative;
+      padding: 1.1rem 1.6rem 1.25rem;
+      background:
+        linear-gradient(180deg, rgba(28, 18, 12, 0.82), rgba(12, 8, 6, 0.88)),
+        radial-gradient(120% 80% at 50% 0%, var(--ember-glow), transparent 55%);
+      border: 1px solid var(--line);
+      box-shadow:
+        0 0 0 1px rgba(0, 0, 0, 0.45),
+        0 18px 40px var(--shadow),
+        inset 0 1px 0 rgba(255, 220, 170, 0.12);
+    }
+
+    .plate::before,
+    .plate::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      width: 42px;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--ember), transparent);
+    }
+
+    .plate::before { left: -36px; }
+    .plate::after { right: -36px; }
+
+    .eyebrow {
+      font-family: "Cinzel", serif;
+      font-size: 0.72rem;
+      letter-spacing: 0.28em;
+      text-transform: uppercase;
+      color: var(--ember);
+      margin-bottom: 0.35rem;
+      text-align: center;
+    }
+
+    .message {
+      font-family: "Cinzel", serif;
+      font-weight: 700;
+      font-size: clamp(1.35rem, 2.8vw, 2.1rem);
+      line-height: 1.25;
+      text-align: center;
+      text-wrap: balance;
+      text-shadow: 0 2px 12px rgba(0, 0, 0, 0.65);
+    }
+
+    .sub {
+      margin-top: 0.45rem;
+      text-align: center;
+      font-size: 0.95rem;
+      opacity: 0.78;
+    }
+
+    .status {
+      position: fixed;
+      right: 12px;
+      bottom: 10px;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      opacity: 0.35;
+      font-family: "Cinzel", serif;
+    }
+
+    .status.ok { opacity: 0.55; color: #9dcea0; }
+    .status.bad { opacity: 0.7; color: #e08a7a; }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <div id="banner" class="banner" aria-live="polite">
+      <div class="plate">
+        <div class="eyebrow">Channel Chaos</div>
+        <div id="message" class="message">Waiting for redeems…</div>
+        <div id="sub" class="sub"></div>
+      </div>
+    </div>
+  </div>
+  <div id="status" class="status">websocket…</div>
+
+  <script>
+    // Streamer.bot → Servers / Clients → Websocket Server (default port 8080)
+    const WS_URL = "ws://127.0.0.1:8080/";
+    const DISPLAY_MS = 6500;
+
+    const banner = document.getElementById("banner");
+    const messageEl = document.getElementById("message");
+    const subEl = document.getElementById("sub");
+    const statusEl = document.getElementById("status");
+
+    let hideTimer = null;
+    let socket = null;
+    let retryMs = 1000;
+
+    function setStatus(text, cls) {
+      statusEl.textContent = text;
+      statusEl.className = "status " + (cls || "");
+    }
+
+    function showAnnouncement(payload) {
+      if (!payload || typeof payload !== "object") return;
+
+      const text = payload.message || "Chaos strikes";
+      messageEl.textContent = text;
+
+      const bits = [];
+      if (payload.user) bits.push(payload.user);
+      if (payload.eventKind) bits.push(payload.eventKind);
+      subEl.textContent = bits.join(" · ");
+
+      banner.classList.remove("hide");
+      // force reflow so re-showing the same class animates again
+      void banner.offsetWidth;
+      banner.classList.add("show");
+
+      clearTimeout(hideTimer);
+      hideTimer = setTimeout(() => {
+        banner.classList.remove("show");
+        banner.classList.add("hide");
+      }, DISPLAY_MS);
+    }
+
+    function tryParseJson(value) {
+      if (value == null) return null;
+      if (typeof value === "object") return value;
+      if (typeof value !== "string") return null;
+      try {
+        return JSON.parse(value);
+      } catch {
+        return null;
+      }
+    }
+
+    function extractChaosPayload(msg) {
+      // WebsocketBroadcastJson arrives as General.Custom with data as a JSON string:
+      // { event: { source: "General", type: "Custom" }, data: "{...our json...}" }
+      const event = msg && msg.event;
+      if (event && event.source === "General" && event.type === "Custom") {
+        const inner = tryParseJson(msg.data);
+        if (inner && (inner.source === "ockas-elden-chaos" || inner.type === "chaos" || inner.message)) {
+          return inner;
+        }
+      }
+
+      // Fallback: raw / already-unwrapped payload
+      const direct = tryParseJson(msg);
+      if (direct && (direct.source === "ockas-elden-chaos" || direct.type === "chaos")) {
+        return direct;
+      }
+      if (msg && (msg.source === "ockas-elden-chaos" || msg.type === "chaos")) {
+        return msg;
+      }
+      return null;
+    }
+
+    function handleMessage(raw) {
+      const msg = tryParseJson(raw);
+      if (!msg) return;
+
+      // Ignore Subscribe responses / hello acks
+      if (msg.status || msg.id === "elden-chaos-overlay") return;
+
+      const payload = extractChaosPayload(msg);
+      if (payload) showAnnouncement(payload);
+    }
+
+    function connect() {
+      setStatus("connecting…");
+      socket = new WebSocket(WS_URL);
+
+      socket.addEventListener("open", () => {
+        retryMs = 1000;
+        setStatus("live", "ok");
+        // Must subscribe to General.Custom to receive WebsocketBroadcastJson
+        socket.send(JSON.stringify({
+          request: "Subscribe",
+          id: "elden-chaos-overlay",
+          events: {
+            General: ["Custom"]
+          }
+        }));
+      });
+
+      socket.addEventListener("message", (ev) => handleMessage(ev.data));
+
+      socket.addEventListener("close", () => {
+        setStatus("reconnecting…", "bad");
+        setTimeout(connect, retryMs);
+        retryMs = Math.min(retryMs * 1.5, 10000);
+      });
+
+      socket.addEventListener("error", () => {
+        setStatus("error", "bad");
+        try { socket.close(); } catch (_) {}
+      });
+    }
+
+    // Manual preview: overlay/index.html?preview=1
+    const params = new URLSearchParams(location.search);
+    if (params.get("preview") === "1") {
+      showAnnouncement({
+        source: "ockas-elden-chaos",
+        type: "chaos",
+        user: "Preview",
+        eventKind: "spawn",
+        message: "Preview spawned 3 dogs"
+      });
+    }
+
+    connect();
+  </script>
+</body>
+</html>

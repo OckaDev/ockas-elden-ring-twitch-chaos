@@ -1,0 +1,63 @@
+{
+  "udp_port": 22666,
+  "notes": "AOB patterns and offsets can break after Elden Ring patches. Update this file; no rebuild required if only offsets change (DLL reloads config on each command).",
+  "pointers": {
+    "WorldChrMan": {
+      "aob": "48 8B 05 ?? ?? ?? ?? 48 85 C0 74 0F 48 39 88",
+      "instruction_offset": 0,
+      "rip_offset_at": 3,
+      "rip_instruction_size": 7,
+      "comment": "Common WorldChrMan AOB — verify after patches"
+    },
+    "GameDataMan": {
+      "aob": "48 8B 05 ?? ?? ?? ?? 48 85 C0 74 05 48 8B 40 58",
+      "instruction_offset": 0,
+      "rip_offset_at": 3,
+      "rip_instruction_size": 7,
+      "comment": "GameDataMan (Hexinton-style). Code also tries fallback AOBs."
+    }
+  },
+  "player": {
+    "worldchr_player_offset": "0x10EF8",
+    "chr_ins_module_base": "0x190",
+    "hp_current": "0x138",
+    "hp_max": "0x144",
+    "gamedata_player_game_data": "0x08",
+    "stats": {
+      "vigor": "0x3C",
+      "mind": "0x40",
+      "endurance": "0x44",
+      "strength": "0x48",
+      "dexterity": "0x4C",
+      "intelligence": "0x50",
+      "faith": "0x54",
+      "arcane": "0x58"
+    }
+  },
+  "spawn": {
+    "enabled": true,
+    "spawn_fn_aob": "E8 ?? ?? ?? ?? 48 85 DB 74 ?? 48 8B 0D",
+    "enemies": {
+      "dogs": {
+        "model": "c4070",
+        "npc_param_id": 40700000,
+        "think_param_id": 40700000,
+        "name": "Wolf"
+      },
+      "rats": {
+        "model": "c4080",
+        "npc_param_id": 40800000,
+        "think_param_id": 40800000,
+        "name": "Rat"
+      },
+      "hawks": {
+        "model": "c4210",
+        "npc_param_id": 42100000,
+        "think_param_id": 42100000,
+        "name": "Warhawk"
+      }
+    },
+    "spawn_radius": 2.5,
+    "comment": "NPC IDs from soulsmodding character list. Debug spawn call sites vary by build — see spawner.cpp."
+  }
+}

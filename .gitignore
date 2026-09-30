@@ -1,0 +1,39 @@
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vs/
+.vscode/
+.idea/
+*.user
+
+# Build
+mod/build/
+**/Release/
+**/Debug/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+
+# Logs
+*.log
+elden_chaos.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets and machine-local network config (never publish)
+.env
+chaos_net.ini
+**/chaos_net.ini
+
+# Private friend packs / installers
+dist/
+
+# Internal reverse-engineering scratch (not part of the public mod)
+tools/re/

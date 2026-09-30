@@ -1,0 +1,10 @@
+# Copy this next to EldenChaos.dll as chaos_net.ini
+# Do not commit your real copy — it contains a secret.
+
+# HOST (the streamer): leave host empty. The DLL fills in a random secret on first run.
+host=
+port=22667
+secret=change-me-to-a-private-phrase
+
+# FRIEND: set host to the streamer's LAN or VPN address, same port, same secret.
+# host=192.168.0.10
