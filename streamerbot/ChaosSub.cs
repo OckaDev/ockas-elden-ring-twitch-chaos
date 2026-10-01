@@ -15,14 +15,13 @@ using System.Text;
 ///        Check Tier 1 + Tier 2 + Tier 3, and Public + Anonymous
 ///
 /// One sub / resub / single gift = 1 random boss.
-/// A gift bomb of X = X random bosses (capped at 12).
+/// A gift bomb of X = X random bosses.
 /// Right-click Test Trigger on Gift Bomb uses 5 bosses if %gifts% is missing.
 /// </summary>
 public class CPHInline
 {
     const int GameUdpPort = 22666;
     const string TtsVoiceAlias = "Zira";
-    const int MaxBosses = 12;
     const int GiftBombTestDefault = 5;
 
     public bool Execute()
@@ -37,7 +36,6 @@ public class CPHInline
         string user = GetUserName();
         int count = GetBossCount(bombEvent);
         if (count < 1) count = 1;
-        if (count > MaxBosses) count = MaxBosses;
 
         CPH.LogInfo("EldenChaos sub count=" + count + " bombEvent=" + bombEvent +
                     " user=" + user);

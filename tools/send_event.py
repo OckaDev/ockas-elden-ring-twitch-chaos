@@ -18,12 +18,13 @@ ENEMIES = [
     "dogs", "rats", "hawks", "lobster", "crabs", "bear", "tree_sentinel",
     "boss_random", "boss_margit", "boss_godrick", "boss_red_wolf", "boss_rennala",
     "boss_godfrey_shade", "boss_gideon", "boss_godskin", "boss_maliketh",
-    "boss_fire_giant", "boss_godfrey", "boss_radagon", "boss_elden_beast",
+    "boss_malenia", "boss_fire_giant", "boss_godfrey", "boss_radagon", "boss_elden_beast",
 ]
 
 EFFECTS = [
     "heal_hp", "restore_fp", "lose_runes", "give_weapon",
     "unequip", "stat", "spawn", "boss",
+    "ash_of_war", "swap_hands", "flasks", "no_roll", "invert_move",
 ]
 
 
@@ -46,6 +47,14 @@ def main() -> None:
     sub.add_parser("runes")
     sub.add_parser("give_weapon")
     sub.add_parser("unequip")
+    sub.add_parser("ash")
+    sub.add_parser("swap")
+    fl = sub.add_parser("flasks")
+    fl.add_argument("mode", choices=["drain", "refill", "random"], nargs="?", default="random")
+    nr = sub.add_parser("no_roll")
+    nr.add_argument("--ms", type=int, default=5000)
+    inv = sub.add_parser("invert")
+    inv.add_argument("--ms", type=int, default=10000)
 
     st = sub.add_parser("stat")
     st.add_argument("stat", choices=STATS)
@@ -87,6 +96,24 @@ def main() -> None:
     elif args.cmd == "unequip":
         send({"cmd": "effect", "effect": "unequip", "target": tgt("all"), "user": user,
               "message": f"{user} unequipped gear"})
+    elif args.cmd == "ash":
+        send({"cmd": "effect", "effect": "ash_of_war", "target": tgt("all"), "user": user,
+              "message": f"{user} randomized Ash of War"})
+    elif args.cmd == "swap":
+        send({"cmd": "effect", "effect": "swap_hands", "target": tgt("all"), "user": user,
+              "message": f"{user} swapped hands"})
+    elif args.cmd == "flasks":
+        payload = {"cmd": "effect", "effect": "flasks", "target": tgt("all"), "user": user,
+                   "message": f"{user} rolled the flasks"}
+        if args.mode != "random":
+            payload["mode"] = args.mode
+        send(payload)
+    elif args.cmd == "no_roll":
+        send({"cmd": "effect", "effect": "no_roll", "ms": args.ms, "target": tgt("all"),
+              "user": user, "message": f"{user} disabled rolling"})
+    elif args.cmd == "invert":
+        send({"cmd": "effect", "effect": "invert_move", "ms": args.ms, "target": tgt("all"),
+              "user": user, "message": f"{user} inverted movement"})
     elif args.cmd == "stat":
         payload = {"cmd": "effect", "effect": "stat", "stat": args.stat, "target": tgt("all"),
                    "user": user, "message": f"{user} changed {args.stat}"}

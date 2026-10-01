@@ -1,4 +1,5 @@
 #include "command_router.hpp"
+#include "game/input_fx.hpp"
 #include "game/player.hpp"
 #include "game/rtti_dump.hpp"
 #include "game/spawner.hpp"
@@ -103,8 +104,13 @@ int ClampSpawnCount(int n) {
     return n;
 }
 
+int ClampBossCount(int n) {
+    if (n < 1) return 1;
+    return n;
+}
+
 bool SpawnBosses(const Config& cfg, const std::string& key, int count, targets::Mode mode) {
-    count = ClampSpawnCount(count);
+    count = ClampBossCount(count);
     int ok = 0;
     for (int i = 0; i < count; ++i) {
         if (spawner::SpawnNearTargets(cfg, key, 1, mode)) ++ok;
@@ -144,51 +150,60 @@ void Execute(const std::string& json, bool force_local);
 
 void HandleRemoteCommandJson(const std::string& json) {
     const auto c = Lower(JsonString(json, "cmd").value_or(""));
-    if (c == "ent") {
-        auto hs = JsonString(json, "h");
-        const auto fx = JsonFloat(json, "x");
-        const auto fy = JsonFloat(json, "y");
-        const auto fz = JsonFloat(json, "z");
-        const auto hp = JsonInt(json, "hp");
-        if (!hs || !fx || !fy || !fz || !hp) return;
-        uint64_t handle = 0;
-        try {
-            handle = std::stoull(*hs, nullptr, 16);
-        } catch (...) {
-            return;
-        }
-        const auto fr = JsonFloat(json, "r");
-        const auto fq = JsonFloat(json, "q");
-        spawner::ApplyEntState(handle,
-                               static_cast<uint32_t>(JsonInt(json, "n").value_or(0)),
-                               *hp, JsonInt(json, "m").value_or(0), *fx, *fy, *fz,
-                               JsonInt(json, "d").value_or(0) != 0,
-                               JsonInt(json, "a").value_or(-1),
-                               JsonFloat(json, "t").value_or(-1.f),
-                               fr.has_value(),
-                               fr.value_or(0.f),
-                               fq.value_or(0.f));
+    if (c == "rest") {
+        log::Info("Net rest: despawn tracked enemies");
+        spawner::ClearSpawned(false);
         return;
     }
-    if (c == "dmg") {
-        auto hs = JsonString(json, "h");
-        const auto hp = JsonInt(json, "hp");
-        if (!hs || !hp) return;
+    if (c == "hpd" || c == "hp" || c == "pd") {
         uint64_t handle = 0;
         try {
-            handle = std::stoull(*hs, nullptr, 16);
+            handle = std::stoull(JsonString(json, "h").value_or(""), nullptr, 16);
         } catch (...) {
             return;
         }
-        spawner::ApplyEntDamage(handle, *hp);
+        if (c == "hpd") {
+            if (auto d = JsonFloat(json, "d")) spawner::OnRemoteDamage(handle, *d);
+        } else if (c == "hp") {
+            if (auto f = JsonFloat(json, "f")) spawner::OnSharedHp(handle, *f);
+        } else if (auto p = JsonFloat(json, "p")) {
+            // Origin ids use the full u32 range, too big for JsonInt.
+            uint32_t origin = 0;
+            const size_t at = json.find("\"o\":");
+            if (at != std::string::npos) {
+                try {
+                    origin = static_cast<uint32_t>(std::stoul(json.substr(at + 4)));
+                } catch (...) {
+                }
+            }
+            spawner::OnRemotePosture(handle, *p, origin);
+        }
         return;
     }
     log::Info("Net payload: " + json);
     Execute(json, true);
 }
 
-void HandleCommandJson(const std::string& json) {
-    log::Info("UDP payload: " + json);
+void HandleCommandJson(const std::string& json_in) {
+    log::Info("UDP payload: " + json_in);
+    std::string json = json_in;
+
+    // "Drain or refill" is decided once here so every PC gets the same result.
+    {
+        const auto eff = Lower(JsonString(json, "effect").value_or(""));
+        const auto m = Lower(JsonString(json, "mode").value_or(""));
+        if (eff == "flasks" && m != "drain" && m != "refill") {
+            static bool seeded = false;
+            if (!seeded) {
+                std::srand(static_cast<unsigned>(std::time(nullptr)) ^ 0xF1A5u);
+                seeded = true;
+            }
+            const char* pick = (std::rand() % 2 == 0) ? "drain" : "refill";
+            json = std::string("{\"cmd\":\"effect\",\"effect\":\"flasks\",\"mode\":\"") + pick +
+                   "\",\"target\":\"" + JsonString(json_in, "target").value_or("all") + "\"}";
+            log::Info(std::string("Flasks roll: ") + pick);
+        }
+    }
 
     // Multiplayer link: friends run the mod too, so each PC only edits its own player.
     const int friends = net::ClientCount();
@@ -211,15 +226,23 @@ void HandleCommandJson(const std::string& json) {
                     std::srand(static_cast<unsigned>(std::time(nullptr)) ^ 0x51DEu);
                     seeded = true;
                 }
-                const int pick = (target == targets::Mode::Random)
-                                     ? (std::rand() % (friends + 1))
-                                     : 0;
+                int pick = (target == targets::Mode::Random)
+                               ? (std::rand() % (friends + 1))
+                               : 0;
                 float x = 0, y = 0, z = 0;
-                if (spawner::PickParticipantPosition(cfg, pick, x, y, z)) {
+                bool have_pos = spawner::PickParticipantPosition(cfg, pick, x, y, z);
+                // Offline same-PC test: the friend copy is linked but not in our world.
+                if (!have_pos && pick != 0) {
+                    pick = 0;
+                    have_pos = spawner::PickParticipantPosition(cfg, pick, x, y, z);
+                }
+                if (have_pos) {
                     std::string enemy = JsonString(json, "boss").value_or(
                         JsonString(json, "enemy").value_or(isBoss ? "boss_random" : ""));
                     if (!enemy.empty()) {
-                        const int count = ClampSpawnCount(JsonInt(json, "count").value_or(1));
+                        const int count = isBoss
+                            ? ClampBossCount(JsonInt(json, "count").value_or(1))
+                            : ClampSpawnCount(JsonInt(json, "count").value_or(1));
                         for (int n = 0; n < count; ++n) {
                             // boss_random re-rolls each time so a 5-gift is five different bosses.
                             const std::string one = spawner::ResolveKey(enemy);
@@ -412,6 +435,28 @@ void Execute(const std::string& json, bool force_local) {
             if (!player::UnequipRandomGear(cfg, mode)) log::Error("effect unequip failed");
             return;
         }
+        if (e == "ash_of_war" || e == "random_ash") {
+            if (!player::RandomizeAshOfWar(cfg)) log::Error("effect ash_of_war failed");
+            return;
+        }
+        if (e == "swap_hands") {
+            if (!player::SwapHands(cfg)) log::Error("effect swap_hands failed");
+            return;
+        }
+        if (e == "flasks" || e == "drain_flasks" || e == "refill_flasks") {
+            const auto m = Lower(JsonString(json, "mode").value_or(""));
+            const bool fill = e == "refill_flasks" || m == "refill" || m == "fill";
+            if (!player::SetFlasks(cfg, fill)) log::Error("effect flasks failed");
+            return;
+        }
+        if (e == "no_roll") {
+            inputfx::BlockRoll(JsonInt(json, "ms").value_or(5000));
+            return;
+        }
+        if (e == "invert_move" || e == "invert_movement") {
+            inputfx::InvertMovement(JsonInt(json, "ms").value_or(10000));
+            return;
+        }
         if (e == "stat") {
             auto stat = JsonString(json, "stat");
             if (!stat) {
@@ -436,7 +481,7 @@ void Execute(const std::string& json, bool force_local) {
             auto boss = JsonString(json, "boss");
             if (!boss) boss = JsonString(json, "enemy");
             const std::string key = boss ? *boss : "boss_random";
-            const int count = ClampSpawnCount(JsonInt(json, "count").value_or(1));
+            const int count = ClampBossCount(JsonInt(json, "count").value_or(1));
             if (!SpawnBosses(cfg, key, count, mode)) log::Error("effect boss failed");
             return;
         }

@@ -10,13 +10,15 @@ Let Twitch chat mess with your Elden Ring run. Channel Point rewards and subscri
 
 | Viewer action | In-game |
 |---|---|
-| Channel Point rewards you set up | Heal, restore FP, steal 10% runes, ±5 to a stat, give a random weapon, unequip a piece of gear, spawn dogs / rats / hawks / crabs / lobster / runebear / Tree Sentinel |
-| New sub / resub / single gifted sub | One random main boss, scaled to **your** soul level |
-| Gift bomb of X subs | X random bosses (capped at 12) |
+| Channel Point rewards you set up | Heal, restore FP, steal 10% runes, ±5 to a stat, give a random weapon, unequip a piece of gear, random Ash of War, swap left/right hand, drain or refill flasks, no rolling for 5 s, inverted movement for 10 s, spawn dogs / rats / hawks / crabs / lobster / runebear / Tree Sentinel |
+| New sub / resub / single gifted sub | One random main boss at its normal in-game stats |
+| Gift bomb of X subs | X random bosses |
 
-Spawned bosses use their real fog-wall stats, scale with the host's level, and drop the usual remembrance / unique loot when killed.
+Spawned enemies use their normal in-game HP and damage. When killed they give their runes and item drops, and bosses also give their remembrance / unique loot. Resting at a grace despawns them.
 
-Boss pool: Margit, Godrick, Red Wolf of Radagon, Rennala, Godfrey (golden shade), Sir Gideon, Godskin Duo, Maliketh, Fire Giant, Hoarah Loux, Radagon, Elden Beast.
+With friends running the DLL, everyone gets their own copy of each spawn with **shared HP and posture**, so damage from any player counts and you can stance-break it together.
+
+Boss pool: Margit, Godrick, Red Wolf of Radagon, Rennala, Godfrey (golden shade), Sir Gideon, Godskin Duo, Maliketh, Malenia, Fire Giant, Godfrey, Radagon, Elden Beast.
 
 ## How it fits together
 
@@ -27,7 +29,7 @@ Twitch  →  Streamer.bot  →  UDP 127.0.0.1:22666  →  EldenChaos.dll (in Eld
                  └── OBS overlay (optional banner)
 ```
 
-Only the streamer's PC needs Streamer.bot. Friends in Seamless Co-op only need the DLL if you want them to see the same spawns.
+Only the streamer's PC needs Streamer.bot. Friends in Seamless Co-op only need the DLL if you want them to get the spawns and player effects too.
 
 ## Setup (other streamers)
 

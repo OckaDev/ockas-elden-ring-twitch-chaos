@@ -300,13 +300,18 @@ void ClientLoop(NetConfig cfg) {
 
 }  // namespace
 
-void Start() {
+void Start(bool local_test) {
     if (g_running.exchange(true)) return;
 
     WSADATA wsa{};
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
     NetConfig cfg = LoadNetConfig();
+    if (local_test && !cfg.client) {
+        cfg.client = true;
+        cfg.host = "127.0.0.1";
+        log::Info("Net: second game copy on this PC, joining the first one as a test friend");
+    }
     g_client_mode = cfg.client;
 
     if (cfg.client) {

@@ -1,5 +1,6 @@
 #include "game/player.hpp"
 #include "game/memory.hpp"
+#include "game/params.hpp"
 #include "game/targets.hpp"
 #include "game/weapon_ids.hpp"
 #include "util/log.hpp"
@@ -247,6 +248,8 @@ void LogEquipSnapshot(uintptr_t pgd, uintptr_t paramOff) {
     log::Info(line);
 }
 
+constexpr uintptr_t kInvEntryStride = 0x18;
+
 struct InvView {
     uintptr_t obj = 0;
     uintptr_t list = 0;  // entries of stride 0x18
@@ -301,9 +304,25 @@ int DummyForSlot(int slot) {
     return kEmptyId;
 }
 
-using EquipGearFn = void (*)(void* eq, unsigned slot, int* item, int idx, int a, int b, int c);
+// item points at an inventory entry: {gaitem handle, item id, qty, ...}. The game copies
+// the handle into ChrAsm, so a bare item id leaves weapons without an instance (invisible).
+using EquipGearFn = void (*)(void* eq, unsigned slot, void* item, int idx, int a, int b, int c);
 
-bool InvokeEquipGearSeh(uintptr_t fn, void* eq, unsigned slot, int* item, int idx) {
+struct InvEntry {
+    uint32_t handle;
+    uint32_t id;
+    uint32_t qty;
+    uint32_t sort;
+    uint32_t pad[2];
+};
+
+bool ReadInvEntry(const InvView& inv, int normal_idx, InvEntry& out) {
+    if (!inv.list || normal_idx < 0 || normal_idx >= 3072) return false;
+    return mem::Read(inv.list + static_cast<uintptr_t>(normal_idx) * kInvEntryStride, out) &&
+           out.id != 0xFFFFFFFFu;
+}
+
+bool InvokeEquipGearSeh(uintptr_t fn, void* eq, unsigned slot, void* item, int idx) {
     __try {
         auto call = reinterpret_cast<EquipGearFn>(fn);
         call(eq, slot, item, idx, 1, 1, 0);
@@ -427,7 +446,10 @@ bool UnequipViaGame(uintptr_t pgd, int slot) {
             return false;
         }
     }
-    int item = dummy;
+    InvEntry item{};
+    item.handle = static_cast<uint32_t>(dummy);
+    item.id = static_cast<uint32_t>(dummy);
+    if (inv_idx != kEmptyId) ReadInvEntry(inv, inv_idx, item);
     const int call_idx = (inv_idx == kEmptyId) ? kEmptyId : (inv_idx + inv.tail);
     void* eq = reinterpret_cast<void*>(pgd + kEquipGameData);
     if (!InvokeEquipGearSeh(gear, eq, static_cast<unsigned>(slot), &item, call_idx)) {
@@ -485,6 +507,426 @@ bool UnequipRandomOnPgd(uintptr_t pgd) {
     }
     log::Warn("Unequip: every occupied slot failed to clear");
     return false;
+}
+
+// ---- equipment chaos -------------------------------------------------------
+
+// EquipInventoryData lists (fromsoftware-rs InventoryItemsData). Flasks live in the
+// normal list on live ER; the key list is scanned too in case that changes.
+constexpr uintptr_t kInvNormalHead = 0x10;
+constexpr uintptr_t kInvKeyHead = 0x20;
+constexpr uintptr_t kInvKeyLen = 0x28;
+constexpr uintptr_t kInvEntrySize = 0x18;
+constexpr uintptr_t kMaxCrimsonFlasks = 0x101;
+constexpr uintptr_t kMaxCeruleanFlasks = 0x102;
+
+// CSWepGaitemIns: gem slot handle at +0x28. CSGemGaitemIns: owning weapon at +0x10.
+constexpr uintptr_t kGaitemHandle = 0x08;
+constexpr uintptr_t kGaitemItemId = 0x0C;
+constexpr uintptr_t kWepGemHandle = 0x28;
+constexpr uintptr_t kGemWeaponHandle = 0x10;
+constexpr unsigned kGemType = 0x80000000u;
+
+// EquipParamWeapon / EquipParamGem field offsets (Paramdex ER defs).
+constexpr uintptr_t kWepType = 0x1A6;
+constexpr uintptr_t kWepGemMountType = 0x241;
+constexpr uintptr_t kGemAffinityBits = 0x30;
+constexpr uintptr_t kGemMountBits = 0x38;
+
+// ChrAsm around the param id array: gaitem handles sit right before it, and the
+// selected left/right weapon slot (0..2) before those.
+struct HandLayout {
+    uintptr_t params;
+    uintptr_t handles;
+    uintptr_t left_sel;
+    uintptr_t right_sel;
+};
+
+HandLayout HandsOf(uintptr_t pgd) {
+    const uintptr_t p = ParamArrayOffset(pgd);
+    const uintptr_t h = p - kEquipSlotCount * 4;
+    return {p, h, h - 0x18, h - 0x14};
+}
+
+bool ActiveWeaponSlots(uintptr_t pgd, const HandLayout& h, int& left, int& right) {
+    const uintptr_t eq = pgd + kEquipGameData;
+    uint32_t l = 99, r = 99;
+    if (!mem::Read(eq + h.left_sel, l) || !mem::Read(eq + h.right_sel, r) || l > 2 || r > 2) {
+        log::Warn("Active weapon slots unreadable l=" + std::to_string(l) + " r=" + std::to_string(r));
+        return false;
+    }
+    left = static_cast<int>(l) * 2;
+    right = static_cast<int>(r) * 2 + 1;
+    return true;
+}
+
+int ReadSlotInt(uintptr_t pgd, uintptr_t off, int slot) {
+    int v = kEmptyId;
+    mem::Read(pgd + kEquipGameData + off + static_cast<uintptr_t>(slot) * 4, v);
+    return v;
+}
+
+// Inventory entry behind an equip-list index (normal list, offset by the key capacity).
+// Falls back to a scan by item id when the index no longer points at that item.
+bool EntryForEquipIdx(const InvView& inv, int equip_idx, int param, InvEntry& out, int& out_idx) {
+    const unsigned want = StripType(static_cast<unsigned>(param));
+    const int n = equip_idx - inv.tail;
+    if (ReadInvEntry(inv, n, out) && StripType(out.id) == want) {
+        out_idx = equip_idx;
+        return true;
+    }
+    const int found = FindItemIdx(inv, static_cast<unsigned>(param));
+    if (found >= 0 && ReadInvEntry(inv, found, out)) {
+        out_idx = found + inv.tail;
+        return true;
+    }
+    return false;
+}
+
+bool EquipInto(uintptr_t pgd, int slot, int param, int idx) {
+    const uintptr_t gear = ResolveEquipGear();
+    if (!gear) return false;
+    const InvView inv = ResolveInventory(pgd);
+    InvEntry item{};
+    int call_idx = idx;
+    if (!EntryForEquipIdx(inv, idx, param, item, call_idx)) {
+        log::Warn("Equip: item " + std::to_string(param) + " idx " + std::to_string(idx) +
+                  " not in inventory");
+        return false;
+    }
+    void* eq = reinterpret_cast<void*>(pgd + kEquipGameData);
+    if (!InvokeEquipGearSeh(gear, eq, static_cast<unsigned>(slot), &item, call_idx)) {
+        log::Error("equipGear crashed (SEH) slot=" + std::to_string(slot));
+        return false;
+    }
+    return true;
+}
+
+uintptr_t g_gaitem_slot = 0;
+int g_gaitem_tries = 0;
+
+uintptr_t GaitemIns(uint32_t handle) {
+    if (!(handle & (1u << 23))) return 0;
+    const uintptr_t idx = handle & 0xFFFFu;
+    if (idx >= 5120) return 0;
+    if (!g_gaitem_slot && g_gaitem_tries < 3) {
+        ++g_gaitem_tries;
+        g_gaitem_slot = params::FindSingletonSlot("CSGaitemImp", [handle, idx](uintptr_t obj) {
+            uintptr_t ins = 0;
+            uint32_t h = 0;
+            return mem::ReadPtr(obj + 8 + idx * 8, ins) && ins && mem::Read(ins + kGaitemHandle, h) &&
+                   h == handle;
+        });
+        if (g_gaitem_slot) log::Info("CSGaitemImp slot=base+0x" + HexU(g_gaitem_slot - mem::ModuleBase()));
+        else log::Error("CSGaitemImp not found");
+    }
+    if (!g_gaitem_slot) return 0;
+    uintptr_t imp = 0, ins = 0;
+    uint32_t h = 0;
+    if (!mem::ReadPtr(g_gaitem_slot, imp) || !imp) return 0;
+    if (!mem::ReadPtr(imp + 8 + idx * 8, ins) || !ins) return 0;
+    if (!mem::Read(ins + kGaitemHandle, h) || h != handle) return 0;
+    return ins;
+}
+
+// EquipParamWeapon.wepType -> bit in EquipParamGem.canMountWep_* (0x38..0x3C).
+int MountBitForWepType(int t) {
+    switch (t) {
+        case 1: return 0;    // dagger
+        case 3: return 1;    // straight sword
+        case 5: return 2;    // greatsword
+        case 7: return 3;    // colossal sword
+        case 9: return 4;    // curved sword
+        case 11: return 5;   // curved greatsword
+        case 13: return 6;   // katana
+        case 14: return 7;   // twinblade
+        case 15: return 8;   // thrusting sword
+        case 16: return 9;   // heavy thrusting sword
+        case 17: return 10;  // axe
+        case 19: return 11;  // greataxe
+        case 21: return 12;  // hammer
+        case 23: return 13;  // great hammer
+        case 24: return 14;  // flail
+        case 25: return 15;  // spear
+        case 28: return 16;  // great spear
+        case 29: return 18;  // halberd
+        case 31: return 19;  // reaper
+        case 35: return 20;  // fist
+        case 37: return 21;  // claw
+        case 39: return 22;  // whip
+        case 41: return 23;  // colossal weapon
+        case 50: return 24;  // light bow
+        case 51: return 25;  // bow
+        case 53: return 26;  // greatbow
+        case 55: return 27;  // crossbow
+        case 56: return 28;  // ballista
+        case 65: return 32;  // small shield
+        case 67: return 33;  // medium shield
+        case 69: return 34;  // greatshield
+        case 87: return 35;  // torch
+        default: return -1;
+    }
+}
+
+bool IsPlayerAsh(uint32_t id) {
+    if (id % 100 != 0) return false;
+    if (id >= 10000 && id <= 85000) return id != 30900;  // 30900 = "No Skill"
+    return (id >= 400000 && id <= 422000) || id == 800000;
+}
+
+bool RandomizeAshOnPgd(uintptr_t pgd) {
+    const HandLayout h = HandsOf(pgd);
+    int left = 0, right = 0;
+    if (!ActiveWeaponSlots(pgd, h, left, right)) return false;
+    const uintptr_t eq = pgd + kEquipGameData;
+
+    for (int slot : {right, left}) {
+        const int param = ReadSlotInt(pgd, h.params, slot);
+        if (!ParamLooksEquipped(slot, param)) continue;
+        const uint32_t base_id = static_cast<uint32_t>(param) / 100u * 100u;
+        const uintptr_t wrow = params::Row(params::Table::Weapon, base_id);
+        if (!wrow) {
+            log::Warn("Ash of War: no weapon param for " + std::to_string(param));
+            continue;
+        }
+        uint8_t mount = 0;
+        uint16_t wtype = 0;
+        mem::Read(wrow + kWepGemMountType, mount);
+        mem::Read(wrow + kWepType, wtype);
+        if (mount != 2) {
+            log::Info("Ash of War: slot " + std::to_string(slot) + " weapon " + std::to_string(param) +
+                      " has a fixed skill");
+            continue;
+        }
+        const int bit = MountBitForWepType(wtype);
+        if (bit < 0) {
+            log::Warn("Ash of War: weapon type " + std::to_string(wtype) + " not mapped");
+            continue;
+        }
+        // ChrAsm handles can be stale (older builds wrote item ids there); the inventory
+        // entry always carries the real one.
+        uint32_t wep_handle = static_cast<uint32_t>(ReadSlotInt(pgd, h.handles, slot));
+        const int wep_idx = ReadSlotInt(pgd, kEquipIdxList, slot);
+        if (!GaitemIns(wep_handle)) {
+            InvEntry ent{};
+            int ignored = 0;
+            if (EntryForEquipIdx(ResolveInventory(pgd), wep_idx, param, ent, ignored)) wep_handle = ent.handle;
+        }
+        const uintptr_t wep = GaitemIns(wep_handle);
+        if (!wep || !params::RttiNameContains(wep, "WepGaitemIns")) {
+            log::Warn("Ash of War: weapon instance not found handle=0x" + HexU(wep_handle));
+            continue;
+        }
+        uint32_t old_gem_handle = 0;
+        mem::Read(wep + kWepGemHandle, old_gem_handle);
+        const uintptr_t old_gem = GaitemIns(old_gem_handle);
+        uint32_t old_gem_item = 0;
+        if (old_gem) mem::Read(old_gem + kGaitemItemId, old_gem_item);
+
+        const int affinity = (param % 10000) / 100;
+        std::vector<uint32_t> keeps_affinity, fits;
+        int ashes_seen = 0;
+        std::string sample;
+        params::ForEachRow(params::Table::Gem, [&](uint32_t id, uintptr_t row) {
+            if (!IsPlayerAsh(id) || (kGemType | id) == old_gem_item) return;
+            uint8_t mounts[5]{};
+            if (!mem::ReadBytes(row + kGemMountBits, mounts, sizeof(mounts))) return;
+            if (ashes_seen++ == 0) {
+                sample = std::to_string(id) + " mounts=";
+                for (uint8_t b : mounts) sample += HexU(b) + " ";
+            }
+            if (!((mounts[bit / 8] >> (bit % 8)) & 1)) return;
+            fits.push_back(id);
+            uint8_t attrs[2]{};
+            if (affinity < 16 && mem::ReadBytes(row + kGemAffinityBits, attrs, sizeof(attrs)) &&
+                ((attrs[affinity / 8] >> (affinity % 8)) & 1)) {
+                keeps_affinity.push_back(id);
+            }
+        });
+        const auto& pool = keeps_affinity.empty() ? fits : keeps_affinity;
+        if (pool.empty()) {
+            log::Warn("Ash of War: no ash fits weapon " + std::to_string(param) + " type " +
+                      std::to_string(wtype) + " bit " + std::to_string(bit) + " (ashes seen " +
+                      std::to_string(ashes_seen) + ", first " + sample + ")");
+            continue;
+        }
+        const uint32_t gem_id = pool[static_cast<size_t>(std::rand()) % pool.size()];
+        const unsigned gem_item = kGemType | gem_id;
+        if (!CallItemGive(gem_item, 1)) continue;
+
+        // The newest copy of that ash in the inventory is the one we just got.
+        const InvView inv = ResolveInventory(pgd);
+        uint32_t gem_handle = 0, best_sort = 0;
+        for (int i = 0; i < std::min(inv.count + 64, 3000); ++i) {
+            const uintptr_t ent = inv.list + static_cast<uintptr_t>(i) * kInvEntrySize;
+            uint32_t id = 0, gh = 0, sort = 0;
+            if (!mem::Read(ent + 4, id)) break;
+            if (id != gem_item) continue;
+            mem::Read(ent, gh);
+            mem::Read(ent + 0xC, sort);
+            if (!gem_handle || sort >= best_sort) {
+                gem_handle = gh;
+                best_sort = sort;
+            }
+        }
+        const uintptr_t gem = GaitemIns(gem_handle);
+        if (!gem || !params::RttiNameContains(gem, "GemGaitemIns")) {
+            log::Warn("Ash of War: new ash " + std::to_string(gem_id) + " not found in inventory");
+            continue;
+        }
+        uint32_t unattached = 0;
+        mem::Read(gem + kGemWeaponHandle, unattached);
+        mem::Write(gem + kGemWeaponHandle, wep_handle);
+        mem::Write(wep + kWepGemHandle, gem_handle);
+        if (old_gem) mem::Write(old_gem + kGemWeaponHandle, unattached);
+
+        // Re-equip so the game rebuilds the skill and model from the new ash.
+        UnequipViaGame(pgd, slot);
+        if (!EquipInto(pgd, slot, param, wep_idx)) {
+            log::Error("Ash of War: re-equip failed, weapon left in inventory");
+        }
+        log::Info("Ash of War: slot " + std::to_string(slot) + " weapon " + std::to_string(param) +
+                  " ash " + std::to_string(old_gem_item & 0x0FFFFFFFu) + " -> " + std::to_string(gem_id) +
+                  " (pool " + std::to_string(pool.size()) + ")");
+        return true;
+    }
+    log::Warn("Ash of War: no equipped weapon can take an ash");
+    return false;
+}
+
+bool SwapHandsOnPgd(uintptr_t pgd) {
+    const HandLayout h = HandsOf(pgd);
+    int left = 0, right = 0;
+    if (!ActiveWeaponSlots(pgd, h, left, right)) return false;
+    const int pl = ReadSlotInt(pgd, h.params, left);
+    const int pr = ReadSlotInt(pgd, h.params, right);
+    const int il = ReadSlotInt(pgd, kEquipIdxList, left);
+    const int ir = ReadSlotInt(pgd, kEquipIdxList, right);
+    const bool has_l = ParamLooksEquipped(left, pl);
+    const bool has_r = ParamLooksEquipped(right, pr);
+    if (!has_l && !has_r) {
+        log::Warn("Swap hands: both hands empty");
+        return false;
+    }
+    // Free both slots first so neither item is equipped twice mid-swap.
+    if (has_r) UnequipViaGame(pgd, right);
+    if (has_l) UnequipViaGame(pgd, left);
+    if (has_r) EquipInto(pgd, left, pr, ir);
+    if (has_l) EquipInto(pgd, right, pl, il);
+    log::Info("Swap hands: left " + std::to_string(pl) + " <-> right " + std::to_string(pr) + " now L=" +
+              std::to_string(ReadSlotInt(pgd, h.params, left)) + " R=" +
+              std::to_string(ReadSlotInt(pgd, h.params, right)));
+    return true;
+}
+
+// Goods use unindexed gaitem handles that embed the item id (category 3 + flag bit).
+constexpr uint32_t kGoodsHandle = 0xB0000000u;
+constexpr uint32_t kGoodsItem = 0x40000000u;
+
+struct FlaskSwap {
+    uint32_t old_id, new_id, old_handle, new_handle;
+};
+
+// Crimson 1000-1025 / Cerulean 1050-1075: odd id = filled flask, even = empty.
+// An empty flask keeps quantity 1; quantity 0 deletes it from the quick slots.
+int EditFlasks(uintptr_t head, uint32_t len, bool fill, int crimson_max, int cerulean_max,
+               std::vector<FlaskSwap>& swaps) {
+    if (!head || len == 0 || len > 3000) return 0;
+    int n = 0;
+    for (uint32_t i = 0; i < len; ++i) {
+        const uintptr_t ent = head + static_cast<uintptr_t>(i) * kInvEntrySize;
+        uint32_t id = 0, qty = 0, handle = 0;
+        if (!mem::Read(ent + 4, id) || id == 0xFFFFFFFFu) continue;
+        if ((id >> 28) != 4) continue;  // goods only; talismans reuse 1000+ ids
+        const uint32_t raw = id & 0x0FFFFFFFu;
+        const bool crimson = raw >= 1000 && raw <= 1025;
+        const bool cerulean = raw >= 1050 && raw <= 1075;
+        if (!crimson && !cerulean) continue;
+        mem::Read(ent, handle);
+        mem::Read(ent + 8, qty);
+        const uint32_t next_raw = fill ? (raw | 1u) : (raw & ~1u);
+        const uint32_t next_id = kGoodsItem | next_raw;
+        const uint32_t next_handle = kGoodsHandle | next_raw;
+        const int max = crimson ? crimson_max : cerulean_max;
+        const uint32_t next_qty = fill ? static_cast<uint32_t>(std::max(max, 1)) : 1u;
+        mem::Write(ent, next_handle);
+        mem::Write(ent + 4, next_id);
+        mem::Write(ent + 8, next_qty);
+        if (next_id != id) swaps.push_back({id, next_id, handle, next_handle});
+        log::Info(std::string(fill ? "Refill " : "Drain ") + (crimson ? "crimson" : "cerulean") + " id " +
+                  std::to_string(raw) + " x" + std::to_string(qty) + " handle 0x" + HexU(handle) + " -> " +
+                  std::to_string(next_raw) + " x" + std::to_string(next_qty));
+        ++n;
+    }
+    return n;
+}
+
+// Quick slots / pouch store the gaitem handle and ChrAsmEquipEntries stores the item id;
+// both live inside EquipGameData and must follow the flask's new id.
+int RepointFlaskRefs(uintptr_t pgd, const std::vector<FlaskSwap>& swaps) {
+    constexpr uintptr_t kScanStart = 0x60;
+    constexpr uintptr_t kScanEnd = 0x600;
+    const uintptr_t eq = pgd + kEquipGameData;
+    int n = 0;
+    for (uintptr_t off = kScanStart; off < kScanEnd; off += 4) {
+        uint32_t v = 0;
+        if (!mem::Read(eq + off, v)) continue;
+        for (const FlaskSwap& s : swaps) {
+            uint32_t to = 0;
+            if (v == s.old_handle && (s.old_handle >> 28) == 0xB) to = s.new_handle;
+            else if (v == s.old_id) to = s.new_id;
+            else continue;
+            mem::Write(eq + off, to);
+            log::Info("Flasks: EquipGameData+0x" + HexU(off) + " 0x" + HexU(v) + " -> 0x" + HexU(to));
+            ++n;
+            break;
+        }
+    }
+    return n;
+}
+
+bool SetFlasksOnPgd(uintptr_t pgd, bool fill) {
+    const InvView inv = ResolveInventory(pgd);
+    if (!inv.obj) {
+        log::Warn("Flasks: inventory not found");
+        return false;
+    }
+    uint8_t crimson = 0, cerulean = 0;
+    mem::Read(pgd + kMaxCrimsonFlasks, crimson);
+    mem::Read(pgd + kMaxCeruleanFlasks, cerulean);
+    if (crimson + cerulean > 20) {
+        log::Warn("Flasks: max counts look wrong (" + std::to_string(crimson) + "/" +
+                  std::to_string(cerulean) + ")");
+        return false;
+    }
+    // Counts track live entries, not the highest used index, so scan to capacity.
+    struct List {
+        const char* name;
+        uintptr_t head, len, cap;
+    };
+    const List lists[] = {
+        {"normal", kInvNormalHead, kInvNormalHead + 8, kInvNormalHead - 8},
+        {"key", kInvKeyHead, kInvKeyLen, kInvKeyHead - 4},
+    };
+    int n = 0;
+    std::vector<FlaskSwap> swaps;
+    for (const List& l : lists) {
+        uintptr_t head = 0;
+        uint32_t len = 0, cap = 0;
+        if (!mem::ReadPtr(inv.obj + l.head, head) || !head) continue;
+        mem::Read(inv.obj + l.len, len);
+        mem::Read(inv.obj + l.cap, cap);
+        if (cap > 4096) continue;
+        n += EditFlasks(head, std::min<uint32_t>(std::max(len, cap), 3000), fill, crimson, cerulean, swaps);
+    }
+    if (!swaps.empty()) {
+        const int refs = RepointFlaskRefs(pgd, swaps);
+        log::Info("Flasks: repointed " + std::to_string(refs) + " slot references");
+    }
+    log::Info(std::string("Flasks ") + (fill ? "refilled" : "drained") + ": " + std::to_string(n) +
+              " entries (max " + std::to_string(crimson) + " crimson / " + std::to_string(cerulean) +
+              " cerulean)");
+    return n > 0;
 }
 
 }  // namespace
@@ -614,9 +1056,14 @@ const BossLoot* LootForKey(std::string key) {
         {ArmorId(590300), "All-Knowing Greaves"},
     };
     static const LootItem kMaliketh[] = {{GoodsId(2956), "Remembrance of the Black Blade"}};
-    static const LootItem kFireGiant[] = {{GoodsId(2961), "Remembrance of the Fire Giant"}};
     static const LootItem kHoarah[] = {{GoodsId(2957), "Remembrance of Hoarah Loux"}};
+    static const LootItem kMalenia[] = {
+        {GoodsId(2954), "Remembrance of the Rot Goddess"},
+        {GoodsId(196), "Malenia's Great Rune"},
+    };
     static const LootItem kElden[] = {{GoodsId(2963), "Elden Remembrance"}};
+    static const LootItem kFireGiant[] = {{GoodsId(2961), "Remembrance of the Fire Giant"}};
+    static const LootItem kSentinel[] = {{18080000u, "Golden Halberd"}};
 
     static const BossLoot kMargit{"Margit", 12000, nullptr, 0};
     static const BossLoot kGodrickLoot{"Godrick", 20000, kGodrick, 2};
@@ -626,9 +1073,27 @@ const BossLoot* LootForKey(std::string key) {
     static const BossLoot kGideonLoot{"Sir Gideon", 150000, kGideon, 5};
     static const BossLoot kDuo{"Godskin Duo", 170000, nullptr, 0};
     static const BossLoot kMalikethLoot{"Maliketh", 240000, kMaliketh, 1};
-    static const BossLoot kGiantLoot{"Fire Giant", 180000, kFireGiant, 1};
-    static const BossLoot kHoarahLoot{"Hoarah Loux", 300000, kHoarah, 1};
+    static const BossLoot kHoarahLoot{"Godfrey", 300000, kHoarah, 1};
+    static const BossLoot kMaleniaLoot{"Malenia", 480000, kMalenia, 2};
     static const BossLoot kBeastLoot{"Elden Beast", 500000, kElden, 1};
+    static const BossLoot kFireGiantLoot{"Fire Giant", 180000, kFireGiant, 1};
+    // Regular enemies: runes here are only a fallback when NpcParam can't be read.
+    static const BossLoot kSentinelLoot{"Tree Sentinel", 3200, kSentinel, 1};
+    static const BossLoot kDogs{"Wolf", 60, nullptr, 0};
+    static const BossLoot kRats{"Rat", 40, nullptr, 0};
+    static const BossLoot kHawks{"Warhawk", 90, nullptr, 0};
+    static const BossLoot kLobster{"Giant Lobster", 1100, nullptr, 0};
+    static const BossLoot kCrabs{"Crab", 300, nullptr, 0};
+    static const BossLoot kBear{"Runebear", 1400, nullptr, 0};
+
+    if (key == "dogs") return &kDogs;
+    if (key == "rats") return &kRats;
+    if (key == "hawks" || key == "warhawks") return &kHawks;
+    if (key == "lobster" || key == "lobsters") return &kLobster;
+    if (key == "crabs" || key == "crab") return &kCrabs;
+    if (key == "bear" || key == "bears" || key == "runebear") return &kBear;
+    if (key == "tree_sentinel" || key == "treesentinel") return &kSentinelLoot;
+    if (key == "boss_fire_giant" || key == "fire_giant") return &kFireGiantLoot;
 
     if (key == "boss_margit" || key == "margit") return &kMargit;
     if (key == "boss_godrick" || key == "godrick") return &kGodrickLoot;
@@ -638,7 +1103,7 @@ const BossLoot* LootForKey(std::string key) {
     if (key == "boss_gideon" || key == "gideon") return &kGideonLoot;
     if (key == "boss_godskin" || key == "godskin_duo" || key == "godskin") return &kDuo;
     if (key == "boss_maliketh" || key == "maliketh") return &kMalikethLoot;
-    if (key == "boss_fire_giant" || key == "fire_giant") return &kGiantLoot;
+    if (key == "boss_malenia" || key == "malenia") return &kMaleniaLoot;
     if (key == "boss_godfrey" || key == "godfrey" || key == "hoarah") return &kHoarahLoot;
     if (key == "boss_elden_beast" || key == "elden_beast") return &kBeastLoot;
     return nullptr;
@@ -658,27 +1123,40 @@ bool AddRunesOnPgdLocked(uintptr_t pgd, int amount) {
     return true;
 }
 
-bool HasBossDrops(const std::string& enemy_key) { return LootForKey(enemy_key) != nullptr; }
+bool GiveItem(unsigned item_id, unsigned qty) {
+    return CallItemGive(item_id, qty < 1 ? 1 : qty);
+}
 
-int GiveBossKillItems(const std::string& enemy_key) {
+int GiveKillLoot(const std::string& enemy_key) {
     const BossLoot* loot = LootForKey(enemy_key);
-    if (!loot) return -1;
-    int given = 0;
+    if (!loot) return 0;
     for (int i = 0; i < loot->n_items; ++i) {
         const LootItem& it = loot->items[i];
         if (CallItemGive(it.id, 1)) {
-            ++given;
-            log::Info(std::string("Boss drop: ") + loot->label + " -> " + it.name);
+            log::Info(std::string("Kill drop: ") + loot->label + " -> " + it.name);
         } else {
-            log::Warn(std::string("Boss drop failed: ") + loot->label + " -> " + it.name);
+            log::Warn(std::string("Kill drop failed: ") + loot->label + " -> " + it.name);
         }
     }
-    if (loot->n_items == 0) {
-        log::Info(std::string("Boss drop: ") + loot->label + " (runes only)");
-    } else if (given == 0) {
-        log::Warn(std::string("Boss drop: ") + loot->label + " gave no items");
-    }
     return loot->runes;
+}
+
+bool RandomizeAshOfWar(const Config& cfg) {
+    auto pgd = LocalPlayerGameData(cfg);
+    if (!pgd) return false;
+    return RandomizeAshOnPgd(*pgd);
+}
+
+bool SwapHands(const Config& cfg) {
+    auto pgd = LocalPlayerGameData(cfg);
+    if (!pgd) return false;
+    return SwapHandsOnPgd(*pgd);
+}
+
+bool SetFlasks(const Config& cfg, bool fill) {
+    auto pgd = LocalPlayerGameData(cfg);
+    if (!pgd) return false;
+    return SetFlasksOnPgd(*pgd, fill);
 }
 
 int ReadRunes(const Config& cfg) {

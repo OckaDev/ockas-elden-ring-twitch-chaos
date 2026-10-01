@@ -16,18 +16,24 @@ bool PickParticipantPosition(const Config& cfg, int participant, float& x, float
 bool SpawnAtPosition(const Config& cfg, const std::string& enemy_key, int count,
                      float x, float y, float z);
 
-// Host: unique ids so both PCs can puppet the same spawn over the friend link.
+// Host: ids that name the same spawn on every PC.
 bool ReserveRuntimeHandles(const Config& cfg, int count, std::vector<uint64_t>& out_handles);
-// Every PC creates the requested enemy. Host HP/position is copied to friends.
+// Every PC creates its own copy of the enemy at the same spot. Only HP and posture are shared.
 bool SpawnCreatedWithHandles(const Config& cfg, const std::string& enemy_key,
                              const std::vector<uint64_t>& handles, float x, float y, float z);
 
-// Host-authority copy of our spawned enemies (Seamless does not replicate debug creates).
-void RegisterSynced(uint64_t handle, uintptr_t chr);
-void ApplyEntState(uint64_t handle, uint32_t seq, int hp, int mx, float x, float y, float z, bool dead,
-                   int anim_id, float anim_t, bool have_rot, float ang1, float ang2);
-void ApplyEntDamage(uint64_t handle, int hp);
+// Host: a friend's copy lost this fraction of its max HP.
+void OnRemoteDamage(uint64_t handle, float hp_frac);
+// Friend: the host's shared HP fraction.
+void OnSharedHp(uint64_t handle, float frac);
+// Posture damage dealt on another PC's copy (fraction of max). origin 0 = host.
+void OnRemotePosture(uint64_t handle, float posture_frac, uint32_t origin);
+
+// Grace rest unloads every debug spawn. tell_peer notifies the other PC.
+void ClearSpawned(bool tell_peer);
 
 bool SpawnNearPlayer(const Config& cfg, const std::string& enemy_key, int count);
+
+uintptr_t LocalPlayerChr();
 
 }  // namespace chaos::spawner

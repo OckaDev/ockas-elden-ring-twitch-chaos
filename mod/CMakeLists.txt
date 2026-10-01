@@ -12,7 +12,9 @@ add_library(EldenChaos SHARED
     src/udp_server.cpp
     src/command_router.cpp
     src/net_sync.cpp
+    src/game/input_fx.cpp
     src/game/memory.cpp
+    src/game/params.cpp
     src/game/rtti_dump.cpp
     src/game/player.cpp
     src/game/spawner.cpp

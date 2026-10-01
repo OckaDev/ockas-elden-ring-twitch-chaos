@@ -32,7 +32,7 @@ void Write(std::string_view level, std::string_view msg) {
 
 }  // namespace
 
-void Init() {
+void Init(const char* file_name) {
     std::lock_guard lock(g_mu);
     char path[MAX_PATH]{};
     HMODULE self = nullptr;
@@ -45,7 +45,7 @@ void Init() {
     auto slash = p.find_last_of("\\/");
     if (slash != std::string::npos) p = p.substr(0, slash + 1);
     const std::string dir = p;
-    p += "elden_chaos.log";
+    p += file_name;
     g_file.open(p, std::ios::app);
     g_ready = g_file.is_open();
     if (!g_ready) {
@@ -53,7 +53,7 @@ void Init() {
         char tmp[MAX_PATH]{};
         if (GetTempPathA(MAX_PATH, tmp) > 0) {
             g_file.clear();
-            g_file.open(std::string(tmp) + "elden_chaos.log", std::ios::app);
+            g_file.open(std::string(tmp) + file_name, std::ios::app);
             g_ready = g_file.is_open();
             if (g_ready) g_file << "(could not write to " << dir << ")\n";
         }

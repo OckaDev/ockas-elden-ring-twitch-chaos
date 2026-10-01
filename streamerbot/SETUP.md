@@ -42,7 +42,7 @@ Use a **separate** action so gift bombs do not double-fire with channel points.
 | **Twitch → Sub** | New subscriber → 1 random boss |
 | **Twitch → ReSub** | Resub → 1 random boss |
 | **Twitch → Gift Subscription** | One gifted sub → 1 random boss. On this trigger, enable **Ignore Gift Subs from Bombs** |
-| **Twitch → Gift Bomb** | Someone gifts **X** subs → **X** random bosses (capped at 12). On this trigger, enable **Tier 1, 2, and 3** and **Public + Anonymous** or Test Trigger will not fire. |
+| **Twitch → Gift Bomb** | Someone gifts **X** subs → **X** random bosses. On this trigger, enable **Tier 1, 2, and 3** and **Public + Anonymous** or Test Trigger will not fire. |
 
 Do **not** also set `chaosEffect=boss` on `Elden Chaos Reward` for these Twitch sub triggers, or you will spawn twice.
 
@@ -66,6 +66,11 @@ In Streamer.bot you can also **Test Trigger** on Gift Bomb if your version has i
 | `lose_runes` | −10% held runes |
 | `give_weapon` | Adds a random vanilla weapon to inventory |
 | `unequip` | Unequips a random weapon, armor piece, or talisman |
+| `ash_of_war` | Random Ash of War on the equipped weapon (right hand first, then left). Only ashes that fit the weapon type. Weapons with a fixed skill are skipped |
+| `swap_hands` | Swaps the active left- and right-hand items |
+| `flasks` | Coin flip: drains every Crimson/Cerulean flask, or refills them to your max |
+| `no_roll` | No dodge roll / backstep for 5 seconds |
+| `invert_move` | Movement reversed for 10 seconds (left stick and WASD) |
 | `vigor` … `arcane` | That stat **+5 or −5** (rolled) |
 
 ### Random player (`target=random`)
@@ -85,7 +90,9 @@ Works with 1–4 Seamless players (alone = always you).
 
 Boss pool: Margit, Godrick, Red Wolf, Rennala, Godfrey shade, Gideon, Godskin Duo, Maliketh, Fire Giant, Godfrey/Hoarah, Radagon, Elden Beast.
 
-Spawns **create** the enemy near the player (Seamless-synced when friends also have the DLL). Dogs/rats/hawks can fall back to relocating an already-loaded copy if create fails.
+Spawns **create** the enemy near the player. Dogs/rats/hawks can fall back to relocating an already-loaded copy if create fails.
+
+When friends also run the DLL, every PC spawns its own copy at the same spot. The copies move and attack on their own, but **HP and posture are shared**: damage dealt on any PC comes off every copy, and posture damage stacks so you can stance-break together (the stagger animation plays on the copy that takes the breaking hit). When it dies, each player gets that enemy's runes and item drops (rolled from the game's own drop tables) plus remembrances for bosses.
 
 ## 4. Test commands (game running)
 
@@ -95,6 +102,12 @@ python tools/send_event.py fp
 python tools/send_event.py runes
 python tools/send_event.py give_weapon
 python tools/send_event.py unequip
+python tools/send_event.py ash
+python tools/send_event.py swap
+python tools/send_event.py flasks drain
+python tools/send_event.py flasks refill
+python tools/send_event.py no_roll
+python tools/send_event.py invert
 python tools/send_event.py stat vigor 5
 python tools/send_event.py spawn dogs
 python tools/send_event.py spawn lobster

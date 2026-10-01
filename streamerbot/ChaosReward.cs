@@ -11,7 +11,8 @@ using System.Text;
 ///   3. Set sub-action argument OR use reward title matching below:
 ///        Argument name:  chaosEffect
 ///        Argument value: heal_hp | restore_fp | lose_runes | give_weapon |
-///                        unequip | vigor | mind | endurance |
+///                        unequip | ash_of_war | swap_hands | flasks |
+///                        no_roll | invert_move | vigor | mind | endurance |
 ///                        strength | dexterity | intelligence | faith | arcane |
 ///                        lobster | crabs | bear | tree_sentinel | dogs | rats | hawks | boss
 ///
@@ -35,6 +36,7 @@ public class CPHInline
         public string Stat;     // for stat
         public int? Delta;      // fixed delta; null => random ±5 for stats
         public int? Percent;    // runes
+        public int? Ms;         // timed effects
         public string Label;    // human message fragment
     }
 
@@ -55,8 +57,21 @@ public class CPHInline
         if (def.Stat != null && delta == null)
             delta = Rng.Next(2) == 0 ? 5 : -5;
 
+        // Flasks: one coin flip, sent to the game so every player gets the same result.
+        string mode = null;
+        if (def.Effect == "flasks")
+        {
+            mode = Rng.Next(2) == 0 ? "drain" : "refill";
+            def = new EffectDef
+            {
+                Effect = def.Effect,
+                Target = def.Target,
+                Label = mode == "drain" ? "drained everyone's flasks" : "refilled everyone's flasks",
+            };
+        }
+
         string message = BuildMessage(user, def, delta);
-        string json = BuildGameJson(user, def, delta, message);
+        string json = BuildGameJson(user, def, delta, message, mode);
         string overlay = BuildOverlayJson(user, def, delta, message);
 
         CPH.BroadcastUdp(GameUdpPort, json);
@@ -118,6 +133,11 @@ public class CPHInline
         if (t.Contains("rune")) return "lose_runes";
         if (t.Contains("give") && t.Contains("weapon")) return "give_weapon";
         if (t.Contains("unequip")) return "unequip";
+        if (t.Contains("ash")) return "ash_of_war";
+        if (t.Contains("swap") || (t.Contains("left") && t.Contains("right"))) return "swap_hands";
+        if (t.Contains("flask")) return "flasks";
+        if (t.Contains("roll")) return "no_roll";
+        if (t.Contains("invert")) return "invert_move";
         if (t.Contains("lobster")) return "lobster";
         if (t.Contains("crab")) return "crabs";
         if (t.Contains("bear")) return "bear";
@@ -159,7 +179,7 @@ public class CPHInline
         return user + " " + def.Label;
     }
 
-    static string BuildGameJson(string user, EffectDef def, int? delta, string message)
+    static string BuildGameJson(string user, EffectDef def, int? delta, string message, string mode)
     {
         var sb = new StringBuilder();
         sb.Append("{\"cmd\":\"effect\"");
@@ -170,6 +190,8 @@ public class CPHInline
         if (def.Stat != null) sb.Append(",\"stat\":\"").Append(Escape(def.Stat)).Append("\"");
         if (delta.HasValue) sb.Append(",\"delta\":").Append(delta.Value);
         if (def.Percent.HasValue) sb.Append(",\"percent\":").Append(def.Percent.Value);
+        if (def.Ms.HasValue) sb.Append(",\"ms\":").Append(def.Ms.Value);
+        if (mode != null) sb.Append(",\"mode\":\"").Append(mode).Append("\"");
         if (def.Effect == "boss" && def.Enemy == null)
         {
             sb.Append(",\"enemy\":\"boss_random\"");
@@ -212,6 +234,11 @@ public class CPHInline
         Add("lose_runes", new EffectDef { Effect = "lose_runes", Target = "all", Percent = 10, Label = "took 10% of everyone's runes" });
         Add("give_weapon", new EffectDef { Effect = "give_weapon", Target = "all", Label = "gave everyone a random weapon" });
         Add("unequip", new EffectDef { Effect = "unequip", Target = "all", Label = "unequipped random gear on everyone" });
+        Add("ash_of_war", new EffectDef { Effect = "ash_of_war", Target = "all", Label = "randomized everyone's Ash of War" });
+        Add("swap_hands", new EffectDef { Effect = "swap_hands", Target = "all", Label = "swapped everyone's left and right hand" });
+        Add("flasks", new EffectDef { Effect = "flasks", Target = "all", Label = "rolled everyone's flasks" });
+        Add("no_roll", new EffectDef { Effect = "no_roll", Target = "all", Ms = 5000, Label = "disabled rolling for everyone for 5 seconds" });
+        Add("invert_move", new EffectDef { Effect = "invert_move", Target = "all", Ms = 10000, Label = "inverted everyone's movement for 10 seconds" });
 
         foreach (var stat in new[] { "vigor", "mind", "endurance", "strength", "dexterity", "intelligence", "faith", "arcane" })
         {

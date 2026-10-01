@@ -1,5 +1,6 @@
 #include "game/spawner.hpp"
 #include "game/memory.hpp"
+#include "game/params.hpp"
 #include "game/player.hpp"
 #include "game/targets.hpp"
 #include "net_sync.hpp"
@@ -20,7 +21,9 @@
 #include <ctime>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
+#include <unordered_map>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -40,7 +43,6 @@ struct SpawnDef {
 };
 
 // Hexinton debug spawn request (CHRSP) — WorldChrMan + 0x1E640 -> struct*
-constexpr uintptr_t kDbgSpawnPtrOff = 0x1E640;
 constexpr uintptr_t kDbgFlagOff = 0x44;
 constexpr uintptr_t kDbgPosOff = 0xB0;
 constexpr uintptr_t kDbgNpcOff = 0xF0;
@@ -51,29 +53,33 @@ constexpr uintptr_t kDbgChrIdOff = 0x100;
 constexpr uintptr_t kDbgEnemyTypeOff = 0x178;
 constexpr uintptr_t kDbgCharaInitOff = 0x17C;
 constexpr uintptr_t kDbgManipTypeOff = 0x180;
-constexpr size_t kChrSpSize = 0x200;
 
-constexpr uintptr_t kHandleOffset = 0x8;
 constexpr uintptr_t kChrIdOffset = 0x188;
 constexpr uintptr_t kTeamOffset = 0x6C;
 constexpr uintptr_t kModulesOffset = 0x190;
 constexpr uintptr_t kPhysicsOffset = 0x68;
 constexpr uintptr_t kPosOffset = 0x70;
 constexpr uintptr_t kPosAltOffset = 0x80;
-constexpr uintptr_t kAng1Offset = 0x54;
-constexpr uintptr_t kAng2Offset = 0x64;
+constexpr uintptr_t kProxyPosRequestOff = 0x91;
+constexpr uintptr_t kChrCtrlOffset = 0x58;
+constexpr uintptr_t kChrProxyFlagsOff = 0xFC;
+constexpr uint32_t kProxySyncPos = 1u << 0;
 constexpr uintptr_t kCharDataOffset = 0x0;
+constexpr uintptr_t kSuperArmorOffset = 0x40;
+constexpr uintptr_t kSaCur = 0x10;
+constexpr uintptr_t kSaMax = 0x14;
 constexpr uintptr_t kHpCur = 0x138;
 constexpr uintptr_t kHpMax = 0x144;
-constexpr uintptr_t kTimeActOffset = 0x18;
-constexpr uintptr_t kAnimQueueOff = 0x20;
-constexpr uintptr_t kAnimSlotSize = 16;
-constexpr uintptr_t kAnimReadIdxOff = 0xC4;
-constexpr uintptr_t kDebugFlagsOff = 0x538;
-constexpr uintptr_t kNpcThinkOff = 0x5A0;
-constexpr uint32_t kDbgNoMove = 1u << 5;
+constexpr uintptr_t kLocalPlayerOff = 0x1E508;
 constexpr int kEnemyTeam = 6;
-constexpr float kPosSnapMeters = 0.45f;
+
+// NpcParam / ItemLotParam field offsets (Paramdex ER defs).
+constexpr uintptr_t kNpcGetSoul = 0x2C;
+constexpr uintptr_t kNpcItemLotEnemy = 0x30;
+constexpr uintptr_t kLotIds = 0x00;
+constexpr uintptr_t kLotCategories = 0x20;
+constexpr uintptr_t kLotPoints = 0x40;
+constexpr uintptr_t kLotCounts = 0x8A;
 
 // Discovered on current eldenring.exe: Hexinton's 0x1E640 is gone; live CHRSP is 0x1E648.
 uintptr_t g_chrsp_world_off = 0x1E648;
@@ -93,25 +99,74 @@ float Dist2(const Vec3& a, const Vec3& b) {
 }
 
 std::optional<uintptr_t> ResolveWorldChrMan(const Config& cfg) {
-    auto hit = mem::FindAob(cfg.worldchr_aob);
-    if (!hit) return std::nullopt;
-    auto slot = mem::ResolveRip(*hit, cfg.worldchr_rip_offset_at, cfg.worldchr_rip_size);
-    if (!slot) return std::nullopt;
+    // The pattern slot is stable. Scanning the exe on the sync thread was
+    // stalling the game and flooding the log.
+    static uintptr_t slot = 0;
+    if (!slot) {
+        auto hit = mem::FindAob(cfg.worldchr_aob);
+        if (!hit) return std::nullopt;
+        auto resolved = mem::ResolveRip(*hit, cfg.worldchr_rip_offset_at, cfg.worldchr_rip_size);
+        if (!resolved) return std::nullopt;
+        slot = *resolved;
+    }
     uintptr_t world = 0;
-    if (!mem::ReadPtr(*slot, world) || !world) return std::nullopt;
+    if (!mem::ReadPtr(slot, world) || !world) return std::nullopt;
     return world;
 }
 
-std::optional<uintptr_t> PhysicsOf(uintptr_t chr) {
+const Config& SharedConfig() {
+    static Config cfg;
+    static bool loaded = false;
+    if (!loaded) {
+        LoadConfig(cfg);
+        loaded = true;
+    }
+    return cfg;
+}
+
+bool InImage(uintptr_t a) {
+    const uintptr_t b = mem::ModuleBase();
+    const size_t n = mem::ModuleSize();
+    return b && n && a >= b && a < b + n;
+}
+
+bool RttiIs(uintptr_t obj, const char* want) {
+    uintptr_t vt = 0;
+    if (!mem::ReadPtr(obj, vt) || !InImage(vt)) return false;
+    uintptr_t col = 0;
+    if (!mem::ReadPtr(vt - 8, col) || !InImage(col)) return false;
+    uint32_t sig = 0;
+    if (!mem::Read(col, sig) || sig != 1) return false;
+    uint32_t td = 0;
+    if (!mem::Read(col + 0x0C, td) || td == 0) return false;
+    char buf[96]{};
+    if (!mem::ReadBytes(mem::ModuleBase() + td + 0x10, buf, sizeof(buf) - 1)) return false;
+    buf[sizeof(buf) - 1] = '\0';
+    return std::strcmp(buf, want) == 0;
+}
+
+std::optional<uintptr_t> ModuleOf(uintptr_t chr, uintptr_t slot) {
     uintptr_t modules = 0;
     if (!mem::ReadPtr(chr + kModulesOffset, modules) || !modules) return std::nullopt;
-    uintptr_t physics = 0;
-    if (!mem::ReadPtr(modules + kPhysicsOffset, physics) || !physics) return std::nullopt;
-    return physics;
+    uintptr_t mod = 0;
+    if (!mem::ReadPtr(modules + slot, mod) || !mod) return std::nullopt;
+    return mod;
+}
+
+// The Havok capsule keeps its own copy of the transform. Moving only the physics
+// module fights the capsule every frame: bodies sink, float, or get launched.
+void RequestProxySync(uintptr_t chr, uintptr_t physics) {
+    uintptr_t ctrl = 0;
+    if (mem::ReadPtr(chr + kChrCtrlOffset, ctrl) && ctrl && RttiIs(ctrl, ".?AVChrCtrl@CS@@")) {
+        uint32_t flags = 0;
+        if (mem::Read(ctrl + kChrProxyFlagsOff, flags)) mem::Write(ctrl + kChrProxyFlagsOff, flags | kProxySyncPos);
+    }
+    const uint8_t one = 1;
+    mem::Write(physics + kProxyPosRequestOff, one);
 }
 
 std::optional<Vec3> ReadPosFromChr(uintptr_t chr) {
-    auto physics = PhysicsOf(chr);
+    auto physics = ModuleOf(chr, kPhysicsOffset);
     if (!physics) return std::nullopt;
     Vec3 pos{};
     if (!mem::Read(*physics + kPosOffset, pos)) return std::nullopt;
@@ -121,31 +176,31 @@ std::optional<Vec3> ReadPosFromChr(uintptr_t chr) {
     return pos;
 }
 
+// Only used by the dogs/rats/hawks relocate fallback, never on a chaos spawn.
 bool WritePosToChr(uintptr_t chr, const Vec3& pos) {
-    auto physics = PhysicsOf(chr);
+    auto physics = ModuleOf(chr, kPhysicsOffset);
     if (!physics) return false;
     bool ok = mem::Write(*physics + kPosOffset, pos);
     mem::Write(*physics + kPosAltOffset, pos);
+    if (ok) RequestProxySync(chr, *physics);
     return ok;
 }
 
 bool CharData(uintptr_t chr, uintptr_t& data_out) {
-    uintptr_t modules = 0;
-    if (!mem::ReadPtr(chr + kModulesOffset, modules) || !modules) return false;
-    uintptr_t data = 0;
-    if (!mem::ReadPtr(modules + kCharDataOffset, data) || !data) return false;
-    data_out = data;
+    auto data = ModuleOf(chr, kCharDataOffset);
+    if (!data) return false;
+    data_out = *data;
     return true;
 }
+
+int HighestMaxHp(uintptr_t data);
 
 bool ReadHp(uintptr_t chr, int& hp, int& mx) {
     uintptr_t data = 0;
     if (!CharData(chr, data)) return false;
     if (!mem::Read(data + kHpCur, hp)) return false;
-    if (!mem::Read(data + kHpMax, mx) || mx < 1 || mx > 500000) {
-        if (!mem::Read(data + 0x13C, mx) || mx < 1 || mx > 500000) return false;
-    }
-    if (hp < 0 || hp > 500000) return false;
+    mx = HighestMaxHp(data);
+    if (mx < 1 || hp < 0 || hp > 500000) return false;
     return true;
 }
 
@@ -172,237 +227,58 @@ bool WriteHpSeh(uintptr_t chr, int hp) {
     }
 }
 
-bool WritePosSeh(uintptr_t chr, const Vec3& pos) {
-    __try {
-        return WritePosToChr(chr, pos);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-struct Facing {
-    float a1 = 0;
-    float a2 = 0;
-};
-
-std::optional<uintptr_t> TimeActOf(uintptr_t chr) {
-    uintptr_t modules = 0;
-    if (!mem::ReadPtr(chr + kModulesOffset, modules) || !modules) return std::nullopt;
-    uintptr_t ta = 0;
-    if (!mem::ReadPtr(modules + kTimeActOffset, ta) || !ta) return std::nullopt;
-    return ta;
-}
-
-uintptr_t AnimSlotAddr(uintptr_t time_act) {
-    uint32_t idx = 0;
-    if (!mem::Read(time_act + kAnimReadIdxOff, idx) || idx > 9) idx = 0;
-    return time_act + kAnimQueueOff + static_cast<uintptr_t>(idx) * kAnimSlotSize;
-}
-
-bool ReadFacing(uintptr_t chr, Facing& out) {
-    auto physics = PhysicsOf(chr);
-    if (!physics) return false;
-    if (!mem::Read(*physics + kAng1Offset, out.a1)) return false;
-    if (!mem::Read(*physics + kAng2Offset, out.a2)) return false;
-    return std::isfinite(out.a1) && std::isfinite(out.a2);
-}
-
-bool WriteFacing(uintptr_t chr, float a1, float a2) {
-    auto physics = PhysicsOf(chr);
-    if (!physics) return false;
-    if (!std::isfinite(a1) || !std::isfinite(a2)) return false;
-    bool ok = mem::Write(*physics + kAng1Offset, a1);
-    ok = mem::Write(*physics + kAng2Offset, a2) && ok;
-    return ok;
-}
-
-bool ReadAnim(uintptr_t chr, int& id, float& t) {
-    auto ta = TimeActOf(chr);
-    if (!ta) return false;
-    const uintptr_t slot = AnimSlotAddr(*ta);
-    if (!mem::Read(slot, id)) return false;
-    if (!mem::Read(slot + 4, t)) return false;
-    if (id < 0 || id > 20000000) return false;
-    if (!std::isfinite(t) || t < 0.f || t > 120.f) t = 0.f;
+// Stance (posture) of an enemy. It drains on hits and breaks into a stagger at 0.
+bool ReadPosture(uintptr_t chr, uintptr_t& sa_mod, float& cur, float& mx) {
+    auto mod = ModuleOf(chr, kSuperArmorOffset);
+    if (!mod) return false;
+    if (!mem::Read(*mod + kSaCur, cur) || !mem::Read(*mod + kSaMax, mx)) return false;
+    if (!std::isfinite(cur) || !std::isfinite(mx) || mx <= 0.f || mx > 100000.f) return false;
+    if (cur < -1.f || cur > mx + 1.f) return false;
+    sa_mod = *mod;
     return true;
 }
 
-bool WriteAnim(uintptr_t chr, int id, float t) {
-    if (id < 0 || id > 20000000) return false;
-    if (!std::isfinite(t) || t < 0.f) t = 0.f;
-    auto ta = TimeActOf(chr);
-    if (!ta) return false;
-    const uintptr_t slot = AnimSlotAddr(*ta);
-    bool ok = mem::Write(slot, id);
-    ok = mem::Write(slot + 4, t) && ok;
-    ok = mem::Write(slot + 8, t) && ok;
-    // Slot 0 is what most tools read; keep it in sync if the ring is elsewhere.
-    const uintptr_t slot0 = *ta + kAnimQueueOff;
-    if (slot0 != slot) {
-        mem::Write(slot0, id);
-        mem::Write(slot0 + 4, t);
-        mem::Write(slot0 + 8, t);
-    }
-    return ok;
-}
-
-bool FreezePuppet(uintptr_t chr) {
-    uint32_t flags = 0;
-    if (mem::Read(chr + kDebugFlagsOff, flags)) {
-        if ((flags & kDbgNoMove) == 0) {
-            flags |= kDbgNoMove;
-            mem::Write(chr + kDebugFlagsOff, flags);
-        }
-    }
-    int think = 0;
-    if (mem::Read(chr + kNpcThinkOff, think)) {
-        if (think != 0 && think > 1000 && think < 2000000000) {
-            const int zero = 0;
-            mem::Write(chr + kNpcThinkOff, zero);
-        }
-    }
-    return true;
-}
-
-bool ReadFacingSeh(uintptr_t chr, Facing& out) {
+bool ReadPostureSeh(uintptr_t chr, uintptr_t& sa_mod, float& cur, float& mx) {
     __try {
-        return ReadFacing(chr, out);
+        return ReadPosture(chr, sa_mod, cur, mx);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
 }
 
-bool WriteFacingSeh(uintptr_t chr, float a1, float a2) {
-    __try {
-        return WriteFacing(chr, a1, a2);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
+int HighestMaxHp(uintptr_t data) {
+    int best = 0;
+    const uintptr_t offs[] = {0x13C, 0x140, 0x144};
+    for (uintptr_t off : offs) {
+        int v = 0;
+        if (mem::Read(data + off, v) && v > best && v <= 500000) best = v;
     }
+    return best;
 }
 
-bool ReadAnimSeh(uintptr_t chr, int& id, float& t) {
-    __try {
-        return ReadAnim(chr, id, t);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
+int ForceFullHp(uintptr_t chr) {
+    // Leave the param max alone. Writing it too early used to freeze a partial
+    // value, so the body spawned already hurt. Only raise current HP up to the
+    // highest max the game has published.
+    uintptr_t data = 0;
+    if (!CharData(chr, data)) return 0;
+    const int mx = HighestMaxHp(data);
+    if (mx < 1) return 0;
+    mem::Write(data + kHpCur, mx);
+    mem::Write(chr + kTeamOffset, kEnemyTeam);
+    return mx;
 }
 
-bool WriteAnimSeh(uintptr_t chr, int id, float t) {
+int ForceFullHpSeh(uintptr_t chr) {
     __try {
-        return WriteAnim(chr, id, t);
+        return ForceFullHp(chr);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-bool FreezePuppetSeh(uintptr_t chr) {
-    __try {
-        return FreezePuppet(chr);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
+        return 0;
     }
 }
 
 bool EnsureAliveHostile(uintptr_t chr) {
-    uintptr_t data = 0;
-    if (!CharData(chr, data)) return false;
-    int mx = 0;
-    if (!mem::Read(data + kHpMax, mx) || mx < 1 || mx > 500000) {
-        if (!mem::Read(data + 0x13C, mx) || mx < 1 || mx > 500000) mx = 400;
-    }
-    if (mx < 50) mx = 400;
-    mem::Write(data + 0x13C, mx);
-    mem::Write(data + 0x140, mx);
-    mem::Write(data + 0x144, mx);
-    mem::Write(data + kHpCur, mx);
-    mem::Write(chr + kTeamOffset, kEnemyTeam);
-    return true;
-}
-
-using ApplySpFn = void (*)(void* chr, int id, int unk);
-
-bool InvokeApplySpSeh(uintptr_t fn, uintptr_t chr, int id) {
-    __try {
-        auto call = reinterpret_cast<ApplySpFn>(fn);
-        call(reinterpret_cast<void*>(chr), id, 1);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-bool ApplySpEffect(uintptr_t chr, int id) {
-    static uintptr_t fn = 0;
-    static bool resolved = false;
-    if (!resolved) {
-        resolved = true;
-        const char* pat = "0F 28 0D ?? ?? ?? ?? ?? 8D ?? ?? 0F 29 ?? ?? ?? 0F B6 D8";
-        auto hit = mem::FindUniqueAob(pat);
-        if (!hit) hit = mem::FindAob(pat);
-        if (hit) {
-            fn = *hit - 0x1D;
-            log::Info("ApplySpEffect fn=0x" + HexU(fn));
-        } else {
-            log::Warn("ApplySpEffect AOB not found — HP scale only");
-        }
-    }
-    if (!fn || !chr || id <= 0) return false;
-    return InvokeApplySpSeh(fn, chr, id);
-}
-
-float BossHealthbars(std::string key) {
-    for (char& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (key == "boss_margit" || key == "margit") return 10.f;
-    if (key == "boss_godrick" || key == "godrick") return 12.f;
-    if (key == "boss_red_wolf" || key == "red_wolf") return 8.f;
-    if (key == "boss_rennala" || key == "renala" || key == "rennala") return 11.f;
-    if (key == "boss_godfrey_shade" || key == "godfrey_shade") return 13.f;
-    if (key == "boss_gideon" || key == "gideon") return 12.f;
-    if (key == "boss_godskin" || key == "godskin_duo" || key == "godskin") return 15.f;
-    if (key == "boss_maliketh" || key == "maliketh") return 13.f;
-    if (key == "boss_fire_giant" || key == "fire_giant") return 18.f;
-    if (key == "boss_godfrey" || key == "godfrey" || key == "hoarah") return 16.f;
-    if (key == "boss_radagon" || key == "radagon") return 14.f;
-    if (key == "boss_elden_beast" || key == "elden_beast") return 18.f;
-    return 0.f;
-}
-
-int AreaScalingId(int level) {
-    if (level < 1) level = 80;
-    if (level > 400) level = 400;
-    int tier = 1 + ((level - 8) * 20) / 142;
-    if (tier < 1) tier = 1;
-    if (tier > 21) tier = 21;
-    return 7000 + (tier - 1) * 10;
-}
-
-void ScaleSpawnedBoss(uintptr_t chr, const std::string& enemy_key) {
-    const float bars = BossHealthbars(enemy_key);
-    if (bars <= 0.f || !chr) return;
-    Config cfg;
-    LoadConfig(cfg);
-    int level = player::ReadSoulLevel(cfg);
-    int php = player::ReadLocalMaxHp(cfg);
-    if (level < 1) level = 80;
-    if (php < 200) php = 400 + level * 10;
-    int target = static_cast<int>(static_cast<float>(php) * bars);
-    if (target < 1500) target = 1500;
-    if (target > 120000) target = 120000;
-    const int sp = AreaScalingId(level);
-    if (!ApplySpEffect(chr, sp)) {
-        log::Warn("Boss area scaling speffect failed id=" + std::to_string(sp));
-    }
-    uintptr_t data = 0;
-    if (CharData(chr, data)) {
-        mem::Write(data + 0x13C, target);
-        mem::Write(data + 0x140, target);
-        mem::Write(data + 0x144, target);
-        mem::Write(data + kHpCur, target);
-    }
-    log::Info("Boss scale key=" + enemy_key + " RL=" + std::to_string(level) +
-              " playerHP=" + std::to_string(php) + " bossHP=" + std::to_string(target) +
-              " areaSp=" + std::to_string(sp));
+    return ForceFullHp(chr) > 0;
 }
 
 bool LooksLikeChrIns(uintptr_t chr) {
@@ -447,14 +323,13 @@ std::vector<SpawnDef> Catalog(std::string key) {
     }
     if (key == "tree_sentinel" || key == "treesentinel") return {Def(3251), Def(3250)};
 
-    // Fog-wall NpcParam rows (not the unscaled *0000 templates). Think IDs stay on the
-    // rows we already spawn with so AI does not change.
+    // Npc row = the fight you meet them in (that row carries HP and damage).
+    // Think = the combat AI. The 900-phase thinks wait on a boss-room event,
+    // which left Godfrey invisible and pulled players into an unloaded void.
     if (key == "boss_margit" || key == "margit") return {Def(2130, 21300014, 21300000)};
     if (key == "boss_godrick" || key == "godrick") return {Def(4750, 47500014, 47500000)};
-    if (key == "boss_red_wolf" || key == "red_wolf") return {Def(3181, 31810020, 31810000)};
-    if (key == "boss_rennala" || key == "renala" || key == "rennala") {
-        return {Def(2031, 20310000, 20310000)};
-    }
+    if (key == "boss_red_wolf" || key == "red_wolf") return {Def(3181, 31811024, 31810000)};
+    if (key == "boss_rennala" || key == "renala" || key == "rennala") return {Def(2031, 20310024, 20310000)};
     if (key == "boss_godfrey_shade" || key == "godfrey_shade") {
         return {Def(4720, 47200134, 47200000)};
     }
@@ -464,10 +339,11 @@ std::vector<SpawnDef> Catalog(std::string key) {
     if (key == "boss_godskin" || key == "godskin_duo") {
         return {Def(3560, 35600172, 35600000), Def(3570, 35700172, 35700000)};
     }
-    if (key == "boss_maliketh" || key == "maliketh") return {Def(2110, 21101072, 21100000)};
+    if (key == "boss_maliketh" || key == "maliketh") return {Def(2110, 21100072, 21100000)};
+    if (key == "boss_malenia" || key == "malenia") return {Def(2120, 21200056, 21200000)};
     if (key == "boss_fire_giant" || key == "fire_giant") return {Def(4760, 47600050, 47600000)};
     if (key == "boss_godfrey" || key == "godfrey" || key == "hoarah") {
-        return {Def(4721, 47210070, 47210900)};
+        return {Def(4720, 47200070, 47200000)};
     }
     if (key == "boss_radagon" || key == "radagon") return {Def(2190, 21900078, 21900000)};
     if (key == "boss_elden_beast" || key == "elden_beast") return {Def(2200, 22000078, 22000000)};
@@ -486,7 +362,7 @@ std::string ResolveEnemyKey(std::string key) {
         static const char* bosses[] = {
             "boss_margit", "boss_godrick", "boss_red_wolf", "boss_rennala",
             "boss_godfrey_shade", "boss_gideon", "boss_godskin", "boss_maliketh",
-            "boss_fire_giant", "boss_godfrey", "boss_radagon", "boss_elden_beast",
+            "boss_malenia", "boss_fire_giant", "boss_godfrey", "boss_radagon", "boss_elden_beast",
         };
         static bool seeded = false;
         if (!seeded) {
@@ -527,12 +403,6 @@ void TryEnableChrSpawnGate() {
         const uint8_t on = 1;
         if (mem::Write(*addr, on)) log::Info("ChrSpawn gate byte set to 1 (once)");
     }
-}
-
-bool WriteChrIdString(uintptr_t spawn, int model) {
-    wchar_t buf[8] = {};
-    if (std::swprintf(buf, 8, L"c%04d", model) < 0) return false;
-    return mem::WriteBytes(spawn + kDbgChrIdOff, buf, 12);
 }
 
 bool FillAndTriggerCreateSeh(uintptr_t spawn, int model, int npc, int think, int chara,
@@ -607,10 +477,6 @@ std::optional<uintptr_t> ResolveChrSp(uintptr_t world) {
     return std::nullopt;
 }
 
-std::optional<uintptr_t> ResolveOrInstallCreateStruct(uintptr_t world, const Vec3& /*pos*/) {
-    return ResolveChrSp(world);
-}
-
 int ScoreArrayAt(uintptr_t world, uintptr_t offset, std::vector<uintptr_t>& out_ents) {
     out_ents.clear();
     uintptr_t begin = 0, end = 0;
@@ -657,7 +523,7 @@ std::vector<uintptr_t> CollectEntities(uintptr_t world) {
 }
 
 void StickAlive(std::vector<std::pair<uintptr_t, Vec3>> targets) {
-    for (int i = 0; i < 120; ++i) {
+    for (int i = 0; i < 180; ++i) {
         for (const auto& [chr, pos] : targets) {
             WritePosToChr(chr, pos);
             EnsureAliveHostile(chr);
@@ -666,92 +532,102 @@ void StickAlive(std::vector<std::pair<uintptr_t, Vec3>> targets) {
     }
 }
 
-uintptr_t CreateOneAt(uintptr_t world, const SpawnDef& def, const Vec3& pos,
-                      const std::string& enemy_key);
-
-void RegisterBossDrop(uintptr_t chr, const std::string& enemy_key);
-
-int TryCreateNear(uintptr_t world, uintptr_t /*spawn_hint*/, const Vec3& at,
-                  const std::vector<SpawnDef>& defs, int count, const std::string& enemy_key) {
-    if (g_create_disabled || defs.empty()) return 0;
-
-    int created = 0;
-    for (int i = 0; i < count; ++i) {
-        const SpawnDef& def = defs[static_cast<size_t>(i) % defs.size()];
-        const float angle = (6.2831853f / static_cast<float>(count)) * static_cast<float>(i);
-        Vec3 pos{at.x + std::cos(angle) * 4.0f, at.y + 0.5f, at.z + std::sin(angle) * 4.0f};
-        if (CreateOneAt(world, def, pos, enemy_key)) ++created;
-    }
-    return created;
+bool IsLocalPlayer(uintptr_t chr) {
+    if (!chr) return false;
+    auto world = ResolveWorldChrMan(SharedConfig());
+    if (!world) return false;
+    uintptr_t local = 0;
+    if (!mem::ReadPtr(*world + kLocalPlayerOff, local) || !local) return false;
+    return chr == local;
 }
 
-uintptr_t FindNewChr(uintptr_t world, const std::unordered_set<uintptr_t>& before,
-                     const std::unordered_set<int>& wanted, const Vec3& at) {
-    uintptr_t best_match = 0, best_any = 0;
-    float match_d = 1e30f, any_d = 1e30f;
-    for (uintptr_t ent : CollectEntities(world)) {
-        if (before.count(ent)) continue;
-        auto pos = ReadPosFromChr(ent);
-        const float d = pos ? Dist2(*pos, at) : 0.f;
-        int id = 0;
-        mem::Read(ent + kChrIdOffset, id);
-        if (IdInWanted(id, wanted) && d < match_d) {
-            match_d = d;
-            best_match = ent;
-        }
-        if (d < any_d) {
-            any_d = d;
-            best_any = ent;
-        }
-    }
-    return best_match ? best_match : best_any;
-}
+// ---------------------------------------------------------------------------
+// Kill rewards. Debug-created enemies never pay out on their own, so each PC
+// gives its own player what the enemy's params say it drops.
 
-struct WatchedBoss {
-    uintptr_t chr = 0;
+struct Reward {
     std::string key;
-    bool seen_alive = false;
-    int miss = 0;
+    int npc = 0;
+    int model = 0;
 };
 
-std::mutex g_drops_mu;
-std::vector<WatchedBoss> g_drops;
-std::atomic<bool> g_drop_thread{false};
+std::mt19937& Rng() {
+    static std::mt19937 rng{std::random_device{}()};
+    return rng;
+}
 
-void DropThread() {
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
-        std::vector<std::string> dead;
-        {
-            std::lock_guard lock(g_drops_mu);
-            for (auto it = g_drops.begin(); it != g_drops.end();) {
-                int hp = 0, mx = 0;
-                if (!ReadHpSeh(it->chr, hp, mx)) {
-                    ++it->miss;
-                    const int limit = it->seen_alive ? 40 : 80;
-                    if (it->miss >= limit) {
-                        it = g_drops.erase(it);
-                    } else {
-                        ++it;
-                    }
-                    continue;
-                }
-                it->miss = 0;
-                if (hp > 0) {
-                    it->seen_alive = true;
-                    ++it;
-                    continue;
-                }
-                if (it->seen_alive && hp <= 0) {
-                    dead.push_back(it->key);
-                    it = g_drops.erase(it);
-                    continue;
-                }
-                ++it;
-            }
+int NpcRunes(int npc) {
+    if (npc <= 0) return 0;
+    const uintptr_t row = params::Row(params::Table::Npc, static_cast<uint32_t>(npc));
+    if (!row) return 0;
+    uint32_t souls = 0;
+    if (!mem::Read(row + kNpcGetSoul, souls) || souls > 10000000u) return 0;
+    return static_cast<int>(souls);
+}
+
+unsigned LotItemId(int category, int id) {
+    switch (category) {
+        case 1: return 0x40000000u | static_cast<unsigned>(id);  // goods
+        case 2: return static_cast<unsigned>(id);                // weapon
+        case 3: return 0x10000000u | static_cast<unsigned>(id);  // protector
+        case 4: return 0x20000000u | static_cast<unsigned>(id);  // accessory
+        case 5: return 0x80000000u | static_cast<unsigned>(id);  // ash of war
+        default: return 0;
+    }
+}
+
+// An enemy's drop table is a run of consecutive ItemLotParam_enemy rows, each
+// rolled on its own (e.g. 227000000 crab eggs, 227000001 white flesh).
+int RollEnemyLots(const Reward& r) {
+    int lot = 0;
+    if (r.npc > 0) {
+        if (const uintptr_t row = params::Row(params::Table::Npc, static_cast<uint32_t>(r.npc))) {
+            mem::Read(row + kNpcItemLotEnemy, lot);
         }
-        if (dead.empty()) continue;
+    }
+    if (lot <= 0 && r.model > 0) lot = r.model * 100000;
+    if (lot <= 0) return 0;
 
+    int given = 0;
+    for (int k = 0; k < 8; ++k) {
+        const uintptr_t row = params::Row(params::Table::ItemLotEnemy, static_cast<uint32_t>(lot + k));
+        if (!row) break;
+        int ids[8]{}, cats[8]{};
+        uint16_t pts[8]{};
+        uint8_t nums[8]{};
+        if (!mem::ReadBytes(row + kLotIds, ids, sizeof(ids)) ||
+            !mem::ReadBytes(row + kLotCategories, cats, sizeof(cats)) ||
+            !mem::ReadBytes(row + kLotPoints, pts, sizeof(pts)) ||
+            !mem::ReadBytes(row + kLotCounts, nums, sizeof(nums))) {
+            break;
+        }
+        int total = 0;
+        for (uint16_t p : pts) total += p;
+        if (total <= 0) continue;
+        int roll = static_cast<int>(Rng()() % static_cast<unsigned>(total));
+        int pick = -1;
+        for (int i = 0; i < 8; ++i) {
+            if (roll < pts[i]) {
+                pick = i;
+                break;
+            }
+            roll -= pts[i];
+        }
+        if (pick < 0 || ids[pick] <= 0) continue;
+        const unsigned item = LotItemId(cats[pick], ids[pick]);
+        if (!item) continue;
+        const unsigned qty = nums[pick] > 0 ? nums[pick] : 1;
+        if (player::GiveItem(item, qty)) {
+            ++given;
+            log::Info("Drop " + r.key + ": lot " + std::to_string(lot + k) + " item 0x" + HexU(item) +
+                      " x" + std::to_string(qty));
+        }
+    }
+    return given;
+}
+
+void GiveRewards(std::vector<Reward> list) {
+    std::thread([list = std::move(list)]() {
         Config cfg;
         LoadConfig(cfg);
         const int before = player::ReadRunes(cfg);
@@ -761,34 +637,433 @@ void DropThread() {
         if (before >= 0 && after >= before) native = after - before;
 
         int need = 0;
-        for (const auto& key : dead) {
-            const int runes = player::GiveBossKillItems(key);
+        for (const auto& r : list) {
+            const int table = player::GiveKillLoot(r.key);
+            int runes = NpcRunes(r.npc);
+            if (runes <= 0) runes = table;
             if (runes > 0) need += runes;
+            RollEnemyLots(r);
+            log::Info("Kill reward " + r.key + " npc=" + std::to_string(r.npc) + " runes=" +
+                      std::to_string(runes));
         }
-        if (need > native) {
-            player::AddRunes(cfg, need - native);
-        }
-    }
+        if (need > native) player::AddRunes(cfg, need - native);
+    }).detach();
 }
 
-void RegisterBossDrop(uintptr_t chr, const std::string& enemy_key) {
-    if (!chr || !player::HasBossDrops(enemy_key)) return;
+// ---------------------------------------------------------------------------
+// Shared HP and posture. Every PC fights its own copy of the enemy. Damage on
+// any copy is reported as a fraction of max HP; the host keeps the shared
+// fraction and every PC lowers its copy to match.
+
+struct SyncedEnt {
+    uint64_t handle = 0;
+    uintptr_t chr = 0;
+    uintptr_t last_chr = 0;
+    std::string key;
+    int npc = 0;
+    int model = 0;
+    Vec3 home{};
+    bool have_home = false;
+
+    float shared = 1.f;
+    int last_hp = -1;
+    float last_sa = -1.f;
+    int saved_mx = 0;
+    bool seen_alive = false;
+    bool dead = false;
+    int dead_echo = 0;
+    int absent = 0;
+    bool dirty = false;
+    std::chrono::steady_clock::time_point next_bcast{};
+
+    int primed_mx = 0;
+    std::chrono::steady_clock::time_point mx_stable_since{};
+    std::chrono::steady_clock::time_point born{};
+    std::chrono::steady_clock::time_point full_hp_until{};
+};
+
+std::mutex g_ents_mu;
+std::vector<SyncedEnt> g_ents;
+std::atomic<bool> g_sync_started{false};
+
+uint32_t MyOrigin() {
+    static const uint32_t id = [] {
+        std::random_device rd;
+        uint32_t v = 0;
+        while (v == 0) v = rd();
+        return v;
+    }();
+    return net::IsClient() ? id : 0u;
+}
+
+enum class Life { Up, Dead, Missing };
+
+Life LocalLife() {
+    auto world = ResolveWorldChrMan(SharedConfig());
+    if (!world) return Life::Missing;
+    uintptr_t local = 0;
+    if (!mem::ReadPtr(*world + kLocalPlayerOff, local) || !local) return Life::Missing;
+    uintptr_t data = 0;
+    if (!CharData(local, data)) return Life::Missing;
+    int hp = 0, mx = 0;
+    if (!mem::Read(data + kHpCur, hp)) return Life::Missing;
+    mx = HighestMaxHp(data);
+    // Stale WorldChrMan during a grace rest can look like HP 0. A real player
+    // max is hundreds to tens of thousands; junk reads get treated as Missing.
+    if (mx < 200 || mx > 50000 || hp < 0 || hp > 500000) return Life::Missing;
+    return hp <= 0 ? Life::Dead : Life::Up;
+}
+
+// A boss loading for the first time reads HP 0 and model id 0 for a while.
+// Dropping the pointer then leaves the friend's copy unlinked for good.
+bool Fresh(const SyncedEnt& e) {
+    return std::chrono::steady_clock::now() - e.born < std::chrono::seconds(10);
+}
+
+bool HpLock(const SyncedEnt& e) {
+    return std::chrono::steady_clock::now() < e.full_hp_until;
+}
+
+void NoteSpawnHp(SyncedEnt& e, int mx) {
+    if (mx <= 0) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (mx > e.primed_mx) {
+        e.primed_mx = mx;
+        e.mx_stable_since = now;
+        // Max is still climbing: keep filling current HP to it.
+        e.full_hp_until = std::min(e.born + std::chrono::seconds(4), now + std::chrono::milliseconds(800));
+        return;
+    }
+    if (e.mx_stable_since.time_since_epoch().count() == 0) e.mx_stable_since = now;
+}
+
+SyncedEnt* FindEnt(uint64_t handle) {
+    for (auto& e : g_ents) {
+        if (e.handle == handle) return &e;
+    }
+    return nullptr;
+}
+
+void ApplyPostureLocked(SyncedEnt& e, float frac) {
+    if (!e.chr || e.dead || HpLock(e) || frac <= 0.f) return;
+    uintptr_t sa = 0;
+    float cur = 0.f, mx = 0.f;
+    if (!ReadPostureSeh(e.chr, sa, cur, mx)) return;
+    const float next = std::max(0.f, cur - frac * mx);
+    mem::Write(sa + kSaCur, next);
+    e.last_sa = next;
+}
+
+void SyncThread();
+
+void EnsureSyncThread() {
+    if (g_sync_started.exchange(true)) return;
+    std::thread(SyncThread).detach();
+}
+
+void Track(uint64_t handle, uintptr_t chr, const std::string& key, const SpawnDef& def, const Vec3& pos,
+           bool refill) {
+    if (!handle) return;
+    std::lock_guard lock(g_ents_mu);
+    SyncedEnt* e = FindEnt(handle);
+    if (!e) {
+        g_ents.push_back({});
+        e = &g_ents.back();
+        e->handle = handle;
+    }
+    e->chr = chr;
+    e->last_chr = chr;
+    e->key = key;
+    e->npc = def.npc;
+    e->model = def.model;
+    e->home = pos;
+    e->have_home = true;
+    e->dead = false;
+    e->dead_echo = 0;
+    e->absent = 0;
+    e->seen_alive = false;
+    e->last_hp = -1;
+    e->last_sa = -1.f;
+    e->primed_mx = 0;
+    e->mx_stable_since = {};
+    e->born = std::chrono::steady_clock::now();
+    if (refill) {
+        e->shared = 1.f;
+        e->full_hp_until = e->born + std::chrono::milliseconds(800);
+    } else {
+        // Death restore: keep the shared fraction, do not refill.
+        e->full_hp_until = e->born;
+    }
+    EnsureSyncThread();
+    log::Info("Shared HP tracking " + key + " handle=" + HexU(static_cast<uintptr_t>(handle)) +
+              (refill ? " (full)" : " (restore)"));
+}
+
+uintptr_t CreateOneAt(uintptr_t world, const SpawnDef& def, const Vec3& pos);
+
+void TickSyncedOnce() {
+    struct Restore {
+        uint64_t handle = 0;
+        std::string key;
+        int npc = 0;
+        int model = 0;
+        Vec3 pos{};
+    };
+    std::vector<std::pair<uint64_t, float>> hp_out;       // client -> host damage
+    std::vector<std::pair<uint64_t, float>> posture_out;  // our own posture damage
+    std::vector<std::pair<uint64_t, float>> shared_out;   // host -> everyone
+    std::vector<Restore> restore;
+    std::vector<Reward> rewards;
+
+    const Life life = LocalLife();
+    const bool up = life == Life::Up;
+    // Death is HP 0 for a stretch of ticks. A grace rest keeps you alive but
+    // WorldChrMan can look like HP 0 for a frame or two — that is not a death.
+    static int dead_hold = 0;
+    static bool confirmed_death = false;
+    if (life == Life::Dead) {
+        if (++dead_hold >= 45) confirmed_death = true;
+    } else {
+        dead_hold = 0;
+    }
+    bool do_rest = false;
+    static int rest_hold = 0;
+    static uintptr_t last_world = 0;
+    static uintptr_t last_player = 0;
+    const bool client = net::IsClient();
+    const auto now = std::chrono::steady_clock::now();
+    uintptr_t world_ptr = 0;
+    if (auto w = ResolveWorldChrMan(SharedConfig())) world_ptr = *w;
+    uintptr_t player_ptr = 0;
+    if (world_ptr) mem::ReadPtr(world_ptr + kLocalPlayerOff, player_ptr);
+
     {
-        std::lock_guard lock(g_drops_mu);
-        if (g_drops.size() >= 24) {
-            g_drops.erase(g_drops.begin());
+        std::lock_guard lock(g_ents_mu);
+        if (g_ents.empty()) {
+            rest_hold = 0;
+            last_world = world_ptr;
+            last_player = player_ptr;
+            return;
         }
-        g_drops.push_back({chr, enemy_key, false, 0});
+        int live = 0, gone = 0, tracked = 0;
+        for (auto it = g_ents.begin(); it != g_ents.end();) {
+            SyncedEnt& e = *it;
+            if (e.chr) e.last_chr = e.chr;
+            if (e.chr && IsLocalPlayer(e.chr)) e.chr = 0;
+            if (e.chr && e.model != 0 && !Fresh(e)) {
+                int id = 0;
+                if (mem::Read(e.chr + kChrIdOffset, id)) {
+                    if (id > 100000) id /= 10000;
+                    if (id == 0) {
+                        log::Warn("Shared HP link lost for " + e.key + " (model id 0)");
+                        e.chr = 0;
+                    }
+                }
+            }
+
+            // While we are dead or reloading every tracked pointer may already be freed.
+            if (up) {
+                bool present = false;
+                int hp = 0, mx = 0;
+                if (e.chr && HpLock(e)) {
+                    NoteSpawnHp(e, ForceFullHpSeh(e.chr));
+                    if (ReadHpSeh(e.chr, hp, mx)) {
+                        e.last_hp = hp;
+                        if (hp > 0) e.seen_alive = true;
+                    }
+                    uintptr_t sa = 0;
+                    float cur = 0.f, smx = 0.f;
+                    if (ReadPostureSeh(e.chr, sa, cur, smx)) e.last_sa = cur;
+                    present = true;
+                    e.absent = 0;
+                } else if (e.chr && ReadHpSeh(e.chr, hp, mx)) {
+                    present = true;
+                    e.absent = 0;
+                    if (!e.dead) {
+                        if (e.last_hp >= 0 && hp < e.last_hp) {
+                            const float d = static_cast<float>(e.last_hp - hp) / static_cast<float>(mx);
+                            e.shared = std::max(0.f, e.shared - d);
+                            if (client) hp_out.emplace_back(e.handle, d);
+                            else e.dirty = true;
+                        }
+                        const int target = e.shared <= 0.f
+                                               ? 0
+                                               : std::max(1, static_cast<int>(std::lround(e.shared * mx)));
+                        if (hp != target && WriteHpSeh(e.chr, target)) hp = target;
+                        e.last_hp = hp;
+
+                        uintptr_t sa = 0;
+                        float cur = 0.f, smx = 0.f;
+                        if (ReadPostureSeh(e.chr, sa, cur, smx)) {
+                            if (e.last_sa >= 0.f && cur < e.last_sa) {
+                                posture_out.emplace_back(e.handle, (e.last_sa - cur) / smx);
+                            }
+                            e.last_sa = cur;
+                        }
+
+                        if (hp > 0) {
+                            e.seen_alive = true;
+                            e.saved_mx = mx;
+                            if (auto pos = ReadPosFromChr(e.chr)) {
+                                e.home = *pos;
+                                e.have_home = true;
+                            }
+                        } else if (e.seen_alive) {
+                            e.dead = true;
+                            e.shared = 0.f;
+                            if (!client) e.dirty = true;
+                            rewards.push_back({e.key, e.npc, e.model});
+                            log::Info("Shared enemy down: " + e.key);
+                        }
+                    }
+                } else if (!e.dead) {
+                    ++e.absent;
+                    // Keep the pointer across a short miss. Nulling it immediately
+                    // made the next ticks fail forever and looked like a grace rest.
+                    if (e.absent >= 40 && !Fresh(e)) e.chr = 0;
+                }
+                if (present && !e.dead) ++live;
+                if (!e.dead && e.seen_alive) {
+                    ++tracked;
+                    if (!present) ++gone;
+                }
+
+                // Map reload after a death deletes the body. Put the same fight back.
+                if (confirmed_death && !e.dead && !e.chr && e.absent >= 40 && e.have_home &&
+                    e.saved_mx > 0 && e.shared > 0.f) {
+                    restore.push_back({e.handle, e.key, e.npc, e.model, e.home});
+                    e.absent = 0;
+                }
+            }
+
+            if (!client && (e.dirty || now >= e.next_bcast)) {
+                shared_out.emplace_back(e.handle, e.shared);
+                e.dirty = false;
+                e.next_bcast = now + std::chrono::milliseconds(500);
+            }
+
+            const bool never_spawned = !e.chr && !e.seen_alive && now - e.born > std::chrono::seconds(30);
+            if ((e.dead && ++e.dead_echo >= 40) || never_spawned) {
+                it = g_ents.erase(it);
+                continue;
+            }
+            ++it;
+        }
+        if (up && live > 0) confirmed_death = false;
+        const bool world_reloaded =
+            up && !confirmed_death && tracked > 0 && live == 0 &&
+            ((last_world && world_ptr && world_ptr != last_world) ||
+             (last_player && player_ptr && player_ptr != last_player));
+        if (!confirmed_death && up && tracked > 0 && live == 0 && gone >= tracked) {
+            ++rest_hold;
+        } else {
+            rest_hold = 0;
+        }
+        if (world_reloaded || rest_hold >= 45) {
+            do_rest = true;
+            rest_hold = 0;
+            log::Info(std::string("Rest detected (") + (world_reloaded ? "reload" : "enemies gone") +
+                      ") — despawning " + std::to_string(tracked) + " tracked");
+        }
+        last_world = world_ptr;
+        last_player = player_ptr;
     }
-    log::Info("Boss drop watch key=" + enemy_key + " chr=0x" + HexU(chr));
-    if (g_drop_thread.exchange(true)) return;
-    std::thread(DropThread).detach();
+
+    if (!rewards.empty()) GiveRewards(std::move(rewards));
+
+    if (net::IsClient() || net::ClientCount() > 0) {
+        char buf[160];
+        for (const auto& [h, d] : hp_out) {
+            std::snprintf(buf, sizeof(buf), "{\"cmd\":\"hpd\",\"h\":\"%llX\",\"d\":%.6f}",
+                          static_cast<unsigned long long>(h), d);
+            net::SendToHost(buf);
+        }
+        for (const auto& [h, p] : posture_out) {
+            std::snprintf(buf, sizeof(buf), "{\"cmd\":\"pd\",\"h\":\"%llX\",\"p\":%.6f,\"o\":%u}",
+                          static_cast<unsigned long long>(h), p, MyOrigin());
+            if (client) net::SendToHost(buf);
+            else net::Broadcast(buf);
+        }
+        for (const auto& [h, f] : shared_out) {
+            std::snprintf(buf, sizeof(buf), "{\"cmd\":\"hp\",\"h\":\"%llX\",\"f\":%.6f}",
+                          static_cast<unsigned long long>(h), f);
+            net::Broadcast(buf);
+        }
+    }
+
+    if (do_rest) {
+        ClearSpawned(true);
+        return;
+    }
+
+    for (const auto& job : restore) {
+        auto world = ResolveWorldChrMan(SharedConfig());
+        if (!world) continue;
+        const auto defs = Catalog(job.key);
+        if (defs.empty()) continue;
+        SpawnDef def = defs[0];
+        for (const auto& d : defs) {
+            if (d.npc == job.npc) def = d;
+        }
+        log::Info("Respawn restore " + job.key);
+        const uintptr_t chr = CreateOneAt(*world, def, job.pos);
+        if (chr) Track(job.handle, chr, job.key, def, job.pos, false);
+    }
 }
 
-uintptr_t CreateOneAt(uintptr_t world, const SpawnDef& def, const Vec3& pos,
-                      const std::string& enemy_key) {
+void SyncThread() {
+    while (true) {
+        TickSyncedOnce();
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+}
+
+void RememberTracked(std::unordered_set<uintptr_t>& before) {
+    std::lock_guard lock(g_ents_mu);
+    for (const auto& e : g_ents) {
+        if (e.chr) before.insert(e.chr);
+        if (e.last_chr) before.insert(e.last_chr);
+    }
+}
+
+void ForgetChr(uintptr_t chr) {
+    if (!chr) return;
+    std::lock_guard lock(g_ents_mu);
+    for (auto& e : g_ents) {
+        if (e.chr != chr && e.last_chr != chr) continue;
+        e.chr = 0;
+        e.last_chr = 0;
+    }
+}
+
+uintptr_t FindNewChr(uintptr_t world, const std::unordered_set<uintptr_t>& before,
+                     const std::unordered_set<int>& wanted, const Vec3& at) {
+    uintptr_t best_match = 0;
+    float match_d = 1e30f;
+    for (uintptr_t ent : CollectEntities(world)) {
+        if (before.count(ent) || IsLocalPlayer(ent)) continue;
+        int id = 0;
+        if (!mem::Read(ent + kChrIdOffset, id) || !IdInWanted(id, wanted)) continue;
+        auto pos = ReadPosFromChr(ent);
+        if (!pos) continue;
+        const float d = Dist2(*pos, at);
+        if (d > 80.f * 80.f) continue;
+        if (d < match_d) {
+            match_d = d;
+            best_match = ent;
+        }
+    }
+    return best_match;
+}
+
+uintptr_t CreateOneAt(uintptr_t world, const SpawnDef& def, const Vec3& pos) {
     std::unordered_set<uintptr_t> before;
-    for (uintptr_t e : CollectEntities(world)) before.insert(e);
+    std::unordered_map<uintptr_t, Vec3> was;
+    for (uintptr_t e : CollectEntities(world)) {
+        before.insert(e);
+        if (auto p = ReadPosFromChr(e)) was[e] = *p;
+    }
+    RememberTracked(before);
 
     auto spawn_opt = ResolveChrSp(world);
     if (!spawn_opt) {
@@ -810,20 +1085,62 @@ uintptr_t CreateOneAt(uintptr_t world, const SpawnDef& def, const Vec3& pos,
         mem::Write(spawn + kDbgFlagOff, zero);
         log::Warn("CREATE flag stuck for c" + std::to_string(def.model) + " — forced idle");
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(cleared ? 250 : 500));
 
     const auto wanted = ModelsOf({def});
-    uintptr_t chr = FindNewChr(world, before, wanted, pos);
+    uintptr_t chr = 0;
+    // Boss models show up late. Keep looking for a pointer we did not already track,
+    // instead of grabbing the previous Margit.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(cleared ? 2000 : 2500);
+    while (std::chrono::steady_clock::now() < deadline) {
+        chr = FindNewChr(world, before, wanted, pos);
+        if (chr) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    bool reused = false;
+    if (!chr) {
+        // The game sometimes moves the existing body to the new point instead of
+        // allocating another one. Take it only if it actually moved there.
+        for (uintptr_t ent : CollectEntities(world)) {
+            if (!before.count(ent) || IsLocalPlayer(ent)) continue;
+            int id = 0;
+            if (!mem::Read(ent + kChrIdOffset, id) || !IdInWanted(id, wanted)) continue;
+            auto pos_now = ReadPosFromChr(ent);
+            if (!pos_now || Dist2(*pos_now, pos) > 15.f * 15.f) continue;
+            auto old = was.find(ent);
+            if (old != was.end() && Dist2(old->second, pos) <= 15.f * 15.f) continue;
+            chr = ent;
+            reused = true;
+            break;
+        }
+    }
     if (!chr) {
         log::Warn("CREATE no new chr for c" + std::to_string(def.model));
         return 0;
     }
+    if (reused) ForgetChr(chr);
     log::Info("CREATE ok c" + std::to_string(def.model) + " npc=" + std::to_string(def.npc) +
               " chr=0x" + HexU(chr) + " flagCleared=" + (cleared ? "1" : "0"));
     EnsureAliveHostile(chr);
-    ScaleSpawnedBoss(chr, enemy_key);
-    RegisterBossDrop(chr, enemy_key);
     return chr;
+}
+
+int TryCreateNear(uintptr_t world, const Vec3& at, const std::vector<SpawnDef>& defs, int count,
+                  const std::string& enemy_key) {
+    if (g_create_disabled || defs.empty()) return 0;
+
+    int created = 0;
+    for (int i = 0; i < count; ++i) {
+        const SpawnDef& def = defs[static_cast<size_t>(i) % defs.size()];
+        const float angle = (6.2831853f / static_cast<float>(count)) * static_cast<float>(i);
+        Vec3 pos{at.x + std::cos(angle) * 4.0f, at.y + 0.5f, at.z + std::sin(angle) * 4.0f};
+        uintptr_t chr = CreateOneAt(world, def, pos);
+        if (!chr) continue;
+        static std::atomic<uint32_t> local_seq{1};
+        const uint64_t handle = 0xC4A0510000000000ull | local_seq.fetch_add(1);
+        Track(handle, chr, enemy_key, def, pos, true);
+        ++created;
+    }
+    return created;
 }
 
 int TryRelocateNear(uintptr_t world, uintptr_t avoid_chr, const Vec3& at, float radius,
@@ -890,149 +1207,6 @@ int TryRelocateNear(uintptr_t world, uintptr_t avoid_chr, const Vec3& at, float 
     return moved;
 }
 
-struct SyncedEnt {
-    uint64_t handle = 0;
-    uintptr_t chr = 0;
-    int last_applied_hp = -1;
-    int last_dmg_sent = -1;
-    int last_anim = -1;
-    uint32_t last_seq = 0;
-    bool dead = false;
-    int dead_echo = 0;
-    bool puppet_ready = false;
-};
-
-std::mutex g_ents_mu;
-std::vector<SyncedEnt> g_ents;
-std::atomic<uint32_t> g_seq{1};
-std::atomic<bool> g_sync_started{false};
-
-void EnsureChr(SyncedEnt& e) {
-    int hp = 0, mx = 0;
-    if (e.chr && ReadHpSeh(e.chr, hp, mx)) return;
-    e.chr = 0;
-}
-
-void TickSyncedOnce() {
-    struct Packet {
-        uint64_t handle = 0;
-        int hp = 0;
-        int mx = 0;
-        float x = 0, y = 0, z = 0;
-        float ang1 = 0, ang2 = 0;
-        int anim = 0;
-        float anim_t = 0;
-        bool dead = false;
-        bool have_pos = false;
-        bool have_ang = false;
-        bool have_anim = false;
-    };
-    std::vector<Packet> outbox;
-    std::vector<std::pair<uint64_t, int>> dmgbox;
-
-    {
-        std::lock_guard lock(g_ents_mu);
-        if (g_ents.empty()) return;
-
-        const bool client = net::IsClient();
-        for (auto it = g_ents.begin(); it != g_ents.end();) {
-            SyncedEnt& e = *it;
-            EnsureChr(e);
-            int hp = 0, mx = 0;
-            const bool alive_read = e.chr && ReadHpSeh(e.chr, hp, mx);
-            if (!alive_read) {
-                hp = 0;
-                e.dead = true;
-            }
-            if (hp <= 0) e.dead = true;
-
-            if (client) {
-                if (e.chr && !e.dead) FreezePuppetSeh(e.chr);
-                if (!e.dead && e.last_applied_hp > 0 && hp < e.last_applied_hp && hp != e.last_dmg_sent) {
-                    dmgbox.emplace_back(e.handle, hp);
-                    e.last_dmg_sent = hp;
-                }
-            } else if (net::ClientCount() > 0 && e.chr) {
-                Packet p;
-                p.handle = e.handle;
-                p.hp = hp;
-                p.mx = mx;
-                p.dead = e.dead;
-                if (auto pos = ReadPosFromChr(e.chr)) {
-                    p.x = pos->x;
-                    p.y = pos->y;
-                    p.z = pos->z;
-                    p.have_pos = true;
-                }
-                Facing fac{};
-                if (ReadFacingSeh(e.chr, fac)) {
-                    p.ang1 = fac.a1;
-                    p.ang2 = fac.a2;
-                    p.have_ang = true;
-                }
-                int anim = 0;
-                float at = 0.f;
-                if (ReadAnimSeh(e.chr, anim, at)) {
-                    p.anim = anim;
-                    p.anim_t = at;
-                    p.have_anim = true;
-                }
-                if (p.have_pos) outbox.push_back(p);
-            }
-
-            if (e.dead) {
-                ++e.dead_echo;
-                if (e.dead_echo >= 8) {
-                    it = g_ents.erase(it);
-                    continue;
-                }
-            } else {
-                e.dead_echo = 0;
-            }
-            ++it;
-        }
-    }
-
-    for (const auto& [h, hp] : dmgbox) {
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "{\"cmd\":\"dmg\",\"h\":\"%llX\",\"hp\":%d}",
-                      static_cast<unsigned long long>(h), hp);
-        net::SendToHost(buf);
-    }
-    for (const auto& p : outbox) {
-        const uint32_t n = g_seq.fetch_add(1);
-        char buf[384];
-        if (p.have_anim && p.have_ang) {
-            std::snprintf(buf, sizeof(buf),
-                          "{\"cmd\":\"ent\",\"n\":%u,\"h\":\"%llX\",\"hp\":%d,\"m\":%d,"
-                          "\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"d\":%d,"
-                          "\"a\":%d,\"t\":%.3f,\"r\":%.4f,\"q\":%.4f}",
-                          n, static_cast<unsigned long long>(p.handle), p.hp, p.mx,
-                          p.x, p.y, p.z, p.dead ? 1 : 0,
-                          p.anim, p.anim_t, p.ang1, p.ang2);
-        } else {
-            std::snprintf(buf, sizeof(buf),
-                          "{\"cmd\":\"ent\",\"n\":%u,\"h\":\"%llX\",\"hp\":%d,\"m\":%d,"
-                          "\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"d\":%d}",
-                          n, static_cast<unsigned long long>(p.handle), p.hp, p.mx,
-                          p.x, p.y, p.z, p.dead ? 1 : 0);
-        }
-        net::Broadcast(buf);
-    }
-}
-
-void SyncThread() {
-    while (true) {
-        TickSyncedOnce();
-        std::this_thread::sleep_for(std::chrono::milliseconds(33));
-    }
-}
-
-void EnsureSyncThread() {
-    if (g_sync_started.exchange(true)) return;
-    std::thread(SyncThread).detach();
-}
-
 }  // namespace
 
 bool SpawnNearTargets(const Config& cfg, const std::string& enemy_key_in, int count, targets::Mode mode) {
@@ -1081,8 +1255,8 @@ bool SpawnNearTargets(const Config& cfg, const std::string& enemy_key_in, int co
                   " model=c" + std::to_string(defs[0].model));
 
         int n = 0;
-        if (auto spawn = ResolveOrInstallCreateStruct(*world, *pos)) {
-            n = TryCreateNear(*world, *spawn, *pos, defs, count, enemy_key);
+        if (ResolveChrSp(*world)) {
+            n = TryCreateNear(*world, *pos, defs, count, enemy_key);
         } else {
             log::Error("CHRSP unavailable on this game build");
         }
@@ -1157,17 +1331,15 @@ bool SpawnAtPosition(const Config& cfg, const std::string& enemy_key_in, int cou
     if (!world) return false;
 
     const Vec3 pos{x, y, z};
-    log::Info("Synced spawn " + enemy_key + " x" + std::to_string(count) + " at fixed position");
+    log::Info("Spawn " + enemy_key + " x" + std::to_string(count) + " at fixed position");
 
     int n = 0;
-    if (auto spawn = ResolveOrInstallCreateStruct(*world, pos)) {
-        n = TryCreateNear(*world, *spawn, pos, defs, count, enemy_key);
-    }
+    if (ResolveChrSp(*world)) n = TryCreateNear(*world, pos, defs, count, enemy_key);
     if (n <= 0) {
-        log::Error("Synced spawn failed for " + enemy_key);
+        log::Error("Fixed-position spawn failed for " + enemy_key);
         return false;
     }
-    log::Info("Synced spawn ok total=" + std::to_string(n) + " key=" + enemy_key);
+    log::Info("Fixed-position spawn ok total=" + std::to_string(n) + " key=" + enemy_key);
     return true;
 }
 
@@ -1181,7 +1353,6 @@ bool ReserveRuntimeHandles(const Config& cfg, int count, std::vector<uint64_t>& 
     for (int i = 0; i < count; ++i) {
         const uint64_t h = 0xC4A0500000000000ull | (static_cast<uint64_t>(base) + static_cast<uint64_t>(i));
         out_handles.push_back(h);
-        log::Info("Sync id=" + HexU(static_cast<uintptr_t>(h)));
     }
     return true;
 }
@@ -1209,11 +1380,9 @@ bool SpawnCreatedWithHandles(const Config& cfg, const std::string& enemy_key_in,
         const SpawnDef& def = defs[i % defs.size()];
         const float angle = (6.2831853f / static_cast<float>(handles.size())) * static_cast<float>(i);
         Vec3 pos{at.x + std::cos(angle) * 4.0f, at.y + 0.5f, at.z + std::sin(angle) * 4.0f};
-        uintptr_t chr = CreateOneAt(*world, def, pos, enemy_key);
+        uintptr_t chr = CreateOneAt(*world, def, pos);
         if (!chr) continue;
-        WritePosToChr(chr, pos);
-        if (net::IsClient()) FreezePuppetSeh(chr);
-        RegisterSynced(handles[i], chr);
+        Track(handles[i], chr, enemy_key, def, pos, true);
         ++ok;
     }
     if (ok <= 0) {
@@ -1225,121 +1394,73 @@ bool SpawnCreatedWithHandles(const Config& cfg, const std::string& enemy_key_in,
     return true;
 }
 
-void RegisterSynced(uint64_t handle, uintptr_t chr) {
-    if (!handle) return;
+void OnRemoteDamage(uint64_t handle, float hp_frac) {
+    if (net::IsClient() || !handle || !(hp_frac > 0.f)) return;
     std::lock_guard lock(g_ents_mu);
-    for (auto& e : g_ents) {
-        if (e.handle == handle) {
-            e.chr = chr;
-            e.dead = false;
-            e.dead_echo = 0;
-            e.last_anim = -1;
-            e.puppet_ready = false;
-            EnsureSyncThread();
-            return;
-        }
-    }
-    SyncedEnt e;
-    e.handle = handle;
-    e.chr = chr;
-    g_ents.push_back(e);
-    EnsureSyncThread();
-    log::Info("Entity sync tracking handle=" + HexU(static_cast<uintptr_t>(handle)));
+    SyncedEnt* e = FindEnt(handle);
+    if (!e || HpLock(*e)) return;
+    e->shared = std::max(0.f, e->shared - std::min(hp_frac, 1.f));
+    e->dirty = true;
 }
 
-void ApplyEntState(uint64_t handle, uint32_t seq, int hp, int mx, float x, float y, float z, bool dead,
-                   int anim_id, float anim_t, bool have_rot, float ang1, float ang2) {
-    (void)mx;
-    if (!net::IsClient() || !handle) return;
+void OnSharedHp(uint64_t handle, float frac) {
+    if (!net::IsClient() || !handle || !std::isfinite(frac)) return;
+    frac = std::clamp(frac, 0.f, 1.f);
     std::lock_guard lock(g_ents_mu);
-    SyncedEnt* e = nullptr;
-    for (auto& it : g_ents) {
-        if (it.handle == handle) {
-            e = &it;
-            break;
-        }
-    }
+    SyncedEnt* e = FindEnt(handle);
     if (!e) {
+        if (frac <= 0.f) return;
+        // The host's first update can beat our own create.
         g_ents.push_back({});
         e = &g_ents.back();
         e->handle = handle;
+        e->born = std::chrono::steady_clock::now();
+        e->full_hp_until = e->born + std::chrono::milliseconds(800);
+        e->shared = 1.f;
         EnsureSyncThread();
     }
-    if (seq != 0 && seq <= e->last_seq) return;
-    if (seq != 0) e->last_seq = seq;
-    EnsureChr(*e);
-    if (!e->chr) return;
+    if (HpLock(*e)) return;
+    e->shared = std::min(e->shared, frac);
+}
 
-    FreezePuppetSeh(e->chr);
-    if (!e->puppet_ready) {
-        e->puppet_ready = true;
-        log::Info("Puppet: local AI frozen, copying host anim");
+void OnRemotePosture(uint64_t handle, float posture_frac, uint32_t origin) {
+    if (!handle || !(posture_frac > 0.f) || !std::isfinite(posture_frac)) return;
+    if (origin != 0 && origin == MyOrigin()) return;
+    {
+        std::lock_guard lock(g_ents_mu);
+        if (SyncedEnt* e = FindEnt(handle)) ApplyPostureLocked(*e, std::min(posture_frac, 1.f));
     }
-
-    const bool have_pos = std::isfinite(x) && std::isfinite(y) && std::isfinite(z) &&
-                          !(x == 0.f && y == 0.f && z == 0.f);
-    bool anim_changed = false;
-    if (anim_id >= 0) {
-        if (e->last_anim != anim_id) {
-            anim_changed = true;
-            e->last_anim = anim_id;
-        }
-    }
-
-    // Hard snaps cancel attacks. Only correct when the copy drifted, or a new move started.
-    if (have_pos) {
-        float d2 = kPosSnapMeters * kPosSnapMeters + 1.f;
-        if (auto cur = ReadPosFromChr(e->chr)) {
-            d2 = Dist2(*cur, Vec3{x, y, z});
-        }
-        if (anim_changed || d2 > kPosSnapMeters * kPosSnapMeters) {
-            WritePosSeh(e->chr, Vec3{x, y, z});
-        }
-    }
-    if (have_rot) WriteFacingSeh(e->chr, ang1, ang2);
-    if (anim_id >= 0) {
-        const float t = (std::isfinite(anim_t) && anim_t >= 0.f) ? anim_t : 0.f;
-        int local_id = -1;
-        float local_t = 0.f;
-        const bool got = ReadAnimSeh(e->chr, local_id, local_t);
-        // Rewriting the same anim id every tick restarts the clip and looks like a cancel.
-        if (!got || local_id != anim_id) {
-            WriteAnimSeh(e->chr, anim_id, t);
-        } else if (std::fabs(local_t - t) > 0.12f) {
-            WriteAnimSeh(e->chr, anim_id, t);
-        }
-    }
-
-    if (dead || hp <= 0) {
-        WriteHpSeh(e->chr, 0);
-        e->dead = true;
-        e->last_applied_hp = 0;
-        return;
-    }
-    int local = 0, local_mx = 0;
-    if (!ReadHpSeh(e->chr, local, local_mx)) local = hp;
-    if (e->last_applied_hp < 0 || hp <= local) {
-        WriteHpSeh(e->chr, hp);
-        e->last_applied_hp = hp;
-        e->last_dmg_sent = hp;
+    if (!net::IsClient() && net::ClientCount() > 0) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "{\"cmd\":\"pd\",\"h\":\"%llX\",\"p\":%.6f,\"o\":%u}",
+                      static_cast<unsigned long long>(handle), posture_frac, origin);
+        net::Broadcast(buf);
     }
 }
 
-void ApplyEntDamage(uint64_t handle, int hp) {
-    if (net::IsClient() || !handle) return;
-    std::lock_guard lock(g_ents_mu);
-    for (auto& e : g_ents) {
-        if (e.handle != handle) continue;
-        EnsureChr(e);
-        if (!e.chr) return;
-        int cur = 0, mx = 0;
-        if (!ReadHpSeh(e.chr, cur, mx)) return;
-        if (hp >= 0 && hp < cur) {
-            WriteHpSeh(e.chr, hp);
-            if (hp <= 0) e.dead = true;
+void ClearSpawned(bool tell_peer) {
+    std::vector<uintptr_t> chrs;
+    {
+        std::lock_guard lock(g_ents_mu);
+        for (const auto& e : g_ents) {
+            if (e.chr) chrs.push_back(e.chr);
         }
-        return;
+        g_ents.clear();
     }
+    for (uintptr_t chr : chrs) WriteHpSeh(chr, 0);
+    log::Info("Rest: despawned " + std::to_string(chrs.size()) + " tracked enemies");
+    if (!tell_peer) return;
+    const std::string msg = "{\"cmd\":\"rest\"}";
+    if (net::IsClient()) net::SendToHost(msg);
+    else if (net::ClientCount() > 0) net::Broadcast(msg);
+}
+
+uintptr_t LocalPlayerChr() {
+    auto world = ResolveWorldChrMan(SharedConfig());
+    if (!world) return 0;
+    uintptr_t local = 0;
+    if (!mem::ReadPtr(*world + kLocalPlayerOff, local)) return 0;
+    return local;
 }
 
 }  // namespace chaos::spawner
