@@ -7,4 +7,4 @@ port=22667
 secret=change-me-to-a-private-phrase
 
 # FRIEND: set host to the streamer's LAN or VPN address, same port, same secret.
-# host=192.168.0.10
+# host=YOUR_HOST_ADDRESS

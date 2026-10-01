@@ -28,6 +28,8 @@ void OnRemoteDamage(uint64_t handle, float hp_frac);
 void OnSharedHp(uint64_t handle, float frac);
 // Posture damage dealt on another PC's copy (fraction of max). origin 0 = host.
 void OnRemotePosture(uint64_t handle, float posture_frac, uint32_t origin);
+// Shared kill: grant this PC the runes and item drops (once per handle).
+void OnRemoteKill(uint64_t handle, const std::string& key, int npc, int model);
 
 // Grace rest unloads every debug spawn. tell_peer notifies the other PC.
 void ClearSpawned(bool tell_peer);

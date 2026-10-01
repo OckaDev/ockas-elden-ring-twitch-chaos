@@ -546,6 +546,7 @@ bool IsLocalPlayer(uintptr_t chr) {
 // gives its own player what the enemy's params say it drops.
 
 struct Reward {
+    uint64_t handle = 0;
     std::string key;
     int npc = 0;
     int model = 0;
@@ -644,7 +645,7 @@ void GiveRewards(std::vector<Reward> list) {
             if (runes > 0) need += runes;
             RollEnemyLots(r);
             log::Info("Kill reward " + r.key + " npc=" + std::to_string(r.npc) + " runes=" +
-                      std::to_string(runes));
+                      std::to_string(runes) + " (this PC)");
         }
         if (need > native) player::AddRunes(cfg, need - native);
     }).detach();
@@ -672,6 +673,7 @@ struct SyncedEnt {
     bool seen_alive = false;
     bool dead = false;
     int dead_echo = 0;
+    bool rewarded = false;
     int absent = 0;
     bool dirty = false;
     std::chrono::steady_clock::time_point next_bcast{};
@@ -782,6 +784,7 @@ void Track(uint64_t handle, uintptr_t chr, const std::string& key, const SpawnDe
     e->dead_echo = 0;
     e->absent = 0;
     e->seen_alive = false;
+    e->rewarded = false;
     e->last_hp = -1;
     e->last_sa = -1.f;
     e->primed_mx = 0;
@@ -812,6 +815,7 @@ void TickSyncedOnce() {
     std::vector<std::pair<uint64_t, float>> hp_out;       // client -> host damage
     std::vector<std::pair<uint64_t, float>> posture_out;  // our own posture damage
     std::vector<std::pair<uint64_t, float>> shared_out;   // host -> everyone
+    std::vector<Reward> kill_out;                         // notify peers this handle died
     std::vector<Restore> restore;
     std::vector<Reward> rewards;
 
@@ -912,8 +916,12 @@ void TickSyncedOnce() {
                             e.dead = true;
                             e.shared = 0.f;
                             if (!client) e.dirty = true;
-                            rewards.push_back({e.key, e.npc, e.model});
-                            log::Info("Shared enemy down: " + e.key);
+                            if (!e.rewarded) {
+                                e.rewarded = true;
+                                rewards.push_back({e.handle, e.key, e.npc, e.model});
+                                kill_out.push_back({e.handle, e.key, e.npc, e.model});
+                                log::Info("Shared enemy down: " + e.key + " — loot to every PC");
+                            }
                         }
                     }
                 } else if (!e.dead) {
@@ -972,7 +980,7 @@ void TickSyncedOnce() {
     if (!rewards.empty()) GiveRewards(std::move(rewards));
 
     if (net::IsClient() || net::ClientCount() > 0) {
-        char buf[160];
+        char buf[256];
         for (const auto& [h, d] : hp_out) {
             std::snprintf(buf, sizeof(buf), "{\"cmd\":\"hpd\",\"h\":\"%llX\",\"d\":%.6f}",
                           static_cast<unsigned long long>(h), d);
@@ -988,6 +996,13 @@ void TickSyncedOnce() {
             std::snprintf(buf, sizeof(buf), "{\"cmd\":\"hp\",\"h\":\"%llX\",\"f\":%.6f}",
                           static_cast<unsigned long long>(h), f);
             net::Broadcast(buf);
+        }
+        for (const auto& k : kill_out) {
+            std::snprintf(buf, sizeof(buf),
+                          "{\"cmd\":\"kill\",\"h\":\"%llX\",\"k\":\"%s\",\"n\":%d,\"m\":%d}",
+                          static_cast<unsigned long long>(k.handle), k.key.c_str(), k.npc, k.model);
+            if (client) net::SendToHost(buf);
+            else net::Broadcast(buf);
         }
     }
 
@@ -1434,6 +1449,39 @@ void OnRemotePosture(uint64_t handle, float posture_frac, uint32_t origin) {
         char buf[160];
         std::snprintf(buf, sizeof(buf), "{\"cmd\":\"pd\",\"h\":\"%llX\",\"p\":%.6f,\"o\":%u}",
                       static_cast<unsigned long long>(handle), posture_frac, origin);
+        net::Broadcast(buf);
+    }
+}
+
+void OnRemoteKill(uint64_t handle, const std::string& key, int npc, int model) {
+    if (!handle) return;
+    Reward pay;
+    {
+        std::lock_guard lock(g_ents_mu);
+        SyncedEnt* e = FindEnt(handle);
+        if (!e) {
+            g_ents.push_back({});
+            e = &g_ents.back();
+            e->handle = handle;
+            e->born = std::chrono::steady_clock::now();
+            EnsureSyncThread();
+        }
+        if (e->rewarded) return;
+        e->rewarded = true;
+        e->dead = true;
+        e->shared = 0.f;
+        if (!key.empty()) e->key = key;
+        if (npc) e->npc = npc;
+        if (model) e->model = model;
+        pay = {e->handle, e->key, e->npc, e->model};
+    }
+    log::Info("Kill loot from peer: " + pay.key);
+    GiveRewards({pay});
+    if (!net::IsClient() && net::ClientCount() > 0) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "{\"cmd\":\"kill\",\"h\":\"%llX\",\"k\":\"%s\",\"n\":%d,\"m\":%d}",
+                      static_cast<unsigned long long>(pay.handle), pay.key.c_str(), pay.npc, pay.model);
         net::Broadcast(buf);
     }
 }

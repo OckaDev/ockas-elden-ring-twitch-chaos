@@ -1,6 +1,6 @@
 # Ocka's Twitch Viewer Interactable Chaos Mod For Elden Ring
 
-**Version 1.0.0** — by Ocka
+**Version 1.1.0** — by Ocka
 
 Let Twitch chat mess with your Elden Ring run. Channel Point rewards and subscriptions fire chaos effects in-game: heals, stat swings, random weapons, crabs, bosses, and more. Built for **Seamless Co-op** (offline). Not for EAC online.
 
@@ -14,9 +14,9 @@ Let Twitch chat mess with your Elden Ring run. Channel Point rewards and subscri
 | New sub / resub / single gifted sub | One random main boss at its normal in-game stats |
 | Gift bomb of X subs | X random bosses |
 
-Spawned enemies use their normal in-game HP and damage. When killed they give their runes and item drops, and bosses also give their remembrance / unique loot. Resting at a grace despawns them.
+Spawned enemies use their **normal in-game HP and damage**, and they spawn at **full HP**. When killed they give their runes and item drops (bosses also give remembrances / unique loot) **to every player running the DLL**, not only the last hit. Resting at a grace despawns them on every PC. Dying keeps the fight.
 
-With friends running the DLL, everyone gets their own copy of each spawn with **shared HP and posture**, so damage from any player counts and you can stance-break it together.
+With friends running the same DLL, everyone gets their own copy of each spawn with **shared HP and posture**. Damage from any player counts, you can stance-break together, and everyone is paid out when it dies.
 
 Boss pool: Margit, Godrick, Red Wolf of Radagon, Rennala, Godfrey (golden shade), Sir Gideon, Godskin Duo, Maliketh, Malenia, Fire Giant, Godfrey, Radagon, Elden Beast.
 
@@ -29,15 +29,15 @@ Twitch  →  Streamer.bot  →  UDP 127.0.0.1:22666  →  EldenChaos.dll (in Eld
                  └── OBS overlay (optional banner)
 ```
 
-Only the streamer's PC needs Streamer.bot. Friends in Seamless Co-op only need the DLL if you want them to get the spawns and player effects too.
+Only the streamer's PC needs Streamer.bot. Friends in Seamless Co-op only need the DLL if you want them to get the spawns, player effects, and kill loot too.
 
-## Setup (other streamers)
+## Setup
 
-Full steps: **[docs/INSTALL.md](docs/INSTALL.md)**
+Full walkthrough: **[docs/INSTALL.md](docs/INSTALL.md)**
 
 Streamer.bot paste-ins: **[streamerbot/SETUP.md](streamerbot/SETUP.md)**
 
-1. Build `EldenChaos.dll` (Visual Studio 2022 + CMake) or use a release DLL when one is attached to a GitHub Release.
+1. Grab `EldenChaos.dll` from a [GitHub Release](https://github.com/OckaDev/ockas-elden-ring-twitch-chaos/releases), or build it (Visual Studio 2022 + CMake).
 2. Drop the DLL + `config/` into Elden Ring `Game\mods\` ([Elden Mod Loader](https://www.nexusmods.com/eldenring/mods/117)) **or** load it beside Seamless via Mod Engine 2.
 3. In Streamer.bot, paste `streamerbot/ChaosReward.cs` and `streamerbot/ChaosSub.cs`, then hook your Channel Point rewards and sub events.
 4. Optional: OBS Browser Source → `overlay/index.html`, Speaker.bot for TTS.
@@ -49,7 +49,20 @@ Test without going live:
 python tools/send_event.py heal
 python tools/send_event.py boss
 python tools/send_event.py spawn lobster
+python tools/send_event.py ash
+python tools/send_event.py flasks drain
 ```
+
+## Files you copy after updating
+
+| What | File | Where it goes |
+|---|---|---|
+| In-game mod | `EldenChaos.dll` + `config/` | `ELDEN RING\Game\mods\` (game closed) |
+| Channel points | `streamerbot/ChaosReward.cs` | Streamer.bot action **Elden Chaos Reward** — replace the C#, Compile |
+| Subs | `streamerbot/ChaosSub.cs` | Streamer.bot action **Elden Chaos Sub** — replace the C#, Compile |
+| Overlay | `overlay/index.html` | OBS Browser Source local file |
+
+Friends need the new DLL too (same `secret` in `chaos_net.ini`). They do not need Streamer.bot or the overlay.
 
 ## Requirements
 

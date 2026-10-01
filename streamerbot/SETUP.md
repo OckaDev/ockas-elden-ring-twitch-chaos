@@ -1,5 +1,14 @@
 # Streamer.bot setup (channel points + sub)
 
+Paste these two files into Streamer.bot. After every mod update, paste them again and click **Compile**.
+
+| Action name | File | Triggers |
+|---|---|---|
+| `Elden Chaos Reward` | `streamerbot/ChaosReward.cs` | Each Channel Point reward |
+| `Elden Chaos Sub` | `streamerbot/ChaosSub.cs` | Sub, ReSub, Gift Subscription, Gift Bomb |
+
+The OBS overlay file is `overlay/index.html`. You only need to point OBS at it once unless that file changes.
+
 ## 1. Enable servers
 
 1. **Servers / Clients → Websocket Server** → Enable (port `8080`)
@@ -92,7 +101,7 @@ Boss pool: Margit, Godrick, Red Wolf, Rennala, Godfrey shade, Gideon, Godskin Du
 
 Spawns **create** the enemy near the player. Dogs/rats/hawks can fall back to relocating an already-loaded copy if create fails.
 
-When friends also run the DLL, every PC spawns its own copy at the same spot. The copies move and attack on their own, but **HP and posture are shared**: damage dealt on any PC comes off every copy, and posture damage stacks so you can stance-break together (the stagger animation plays on the copy that takes the breaking hit). When it dies, each player gets that enemy's runes and item drops (rolled from the game's own drop tables) plus remembrances for bosses.
+When friends also run the DLL, every PC spawns its own copy at the same spot. The copies move and attack on their own, but **HP and posture are shared**: damage dealt on any PC comes off every copy, and posture damage stacks so you can stance-break together (the stagger animation plays on the copy that takes the breaking hit). When it dies, **every connected player** gets that enemy's runes and item drops (rolled from the game's own drop tables) plus remembrances for bosses — not only the person who landed the last hit. Resting at a grace despawns the copies on every PC.
 
 ## 4. Test commands (game running)
 
@@ -126,6 +135,7 @@ Friends who join your Seamless session can install the same DLL so they see spaw
 3. Friend: same `EldenChaos.dll` + `config/` folder, plus `chaos_net.ini` with `host=<host address>` and the same secret. See `mod/chaos_net.ini.example`.
 4. When a friend is connected, `target=all` hits everyone; `target=random` picks the host or one friend. Each PC edits its own character.
 5. Log lines: `Net: friend connected`, `Net: connected to host`.
+6. Kill loot: each PC's log should show `Kill reward` or `Kill loot from peer` for the same enemy.
 
 TCP 22667 must be reachable from friend to host (LAN, VPN, or your own port forward).
 

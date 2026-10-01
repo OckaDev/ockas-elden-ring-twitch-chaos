@@ -155,7 +155,7 @@ void HandleRemoteCommandJson(const std::string& json) {
         spawner::ClearSpawned(false);
         return;
     }
-    if (c == "hpd" || c == "hp" || c == "pd") {
+    if (c == "hpd" || c == "hp" || c == "pd" || c == "kill") {
         uint64_t handle = 0;
         try {
             handle = std::stoull(JsonString(json, "h").value_or(""), nullptr, 16);
@@ -166,6 +166,9 @@ void HandleRemoteCommandJson(const std::string& json) {
             if (auto d = JsonFloat(json, "d")) spawner::OnRemoteDamage(handle, *d);
         } else if (c == "hp") {
             if (auto f = JsonFloat(json, "f")) spawner::OnSharedHp(handle, *f);
+        } else if (c == "kill") {
+            spawner::OnRemoteKill(handle, JsonString(json, "k").value_or(""),
+                                  JsonInt(json, "n").value_or(0), JsonInt(json, "m").value_or(0));
         } else if (auto p = JsonFloat(json, "p")) {
             // Origin ids use the full u32 range, too big for JsonInt.
             uint32_t origin = 0;
